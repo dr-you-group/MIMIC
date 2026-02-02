@@ -121,7 +121,7 @@ def get_files_list(path):
 
     s = subprocess.check_output('gsutil ls -r {0}'.format(path), shell=True)
     files_list = s.decode('utf-8').split()
-    files_list = filter(lambda x: '.csv' in x, files_list)
+    files_list = list(filter(lambda x: '.csv' in x, files_list))
 
     return files_list
 
