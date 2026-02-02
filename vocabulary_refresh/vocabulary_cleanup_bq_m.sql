@@ -10,98 +10,20 @@
 -- -------------------------------------------------------------------
 
 
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_1)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_1;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_2)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_2;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_3)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_3;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_5)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_5;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_6)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_6;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_7)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_7;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_8)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_8;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_9)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_9;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_10)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_10;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_11)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_11;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_12)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_12;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_13)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_13;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_14)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_14;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_15)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_15;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_16)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_16;
-END IF
-;
-
-IF NOT EXISTS (SELECT * FROM @bq_target_project.@bq_target_dataset.z_check_voc_17)
-THEN
-    DROP TABLE @bq_target_project.@bq_target_dataset.z_check_voc_17;
-END IF
-;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_1`;                    -- added backticks to resolve BigQuery multi-statement issues
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_2`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_3`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_5`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_6`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_7`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_8`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_9`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_10`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_11`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_12`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_13`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_14`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_15`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_16`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_17`;
+DROP TABLE IF EXISTS `@bq_target_project.@bq_target_dataset.z_check_voc_errors_summary`;
