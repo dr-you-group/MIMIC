@@ -131,31 +131,92 @@ WHERE
 -- -------------------------------------------------------------------
 
 CREATE OR REPLACE TABLE @etl_project.@etl_dataset.lk_obs_admissions_concept AS
+WITH src_codes AS (
+  SELECT DISTINCT
+    src.source_code,
+    src.source_vocabulary_id,
+    src.value_as_string
+  FROM @etl_project.@etl_dataset.lk_observation_clean src
+),
+
+vc_ranked AS (
+  SELECT
+    vc.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY vc.vocabulary_id, vc.domain_id, vc.concept_code
+      ORDER BY
+        (vc.invalid_reason IS NULL) DESC,
+        (vc.standard_concept = 'S') DESC,
+        vc.valid_end_date DESC,
+        vc.concept_id DESC
+    ) AS rn
+  FROM @etl_project.@etl_dataset.voc_concept vc
+),
+
+vc_pick AS (
+  SELECT *
+  FROM vc_ranked
+  WHERE rn = 1
+),
+
+mapped AS (
+  SELECT
+    s.source_code,
+    s.value_as_string AS source_value,
+    s.source_vocabulary_id,
+
+    vc.domain_id  AS source_domain_id,
+    vc.concept_id AS source_concept_id,
+
+    CASE
+      WHEN vc.standard_concept = 'S' AND vc.invalid_reason IS NULL THEN vc.domain_id
+      ELSE vc2.domain_id
+    END AS target_domain_id,
+
+    CASE
+      WHEN vc.standard_concept = 'S' AND vc.invalid_reason IS NULL THEN vc.concept_id
+      ELSE vc2.concept_id
+    END AS target_concept_id
+
+  FROM src_codes s
+
+  LEFT JOIN vc_pick vc
+    ON (
+      (s.source_vocabulary_id = 'mimiciv_obs_drgcodes'
+      AND vc.domain_id = 'Observation'
+      AND vc.vocabulary_id = 'DRG'
+      AND s.source_code = vc.concept_code)
+    OR (s.source_vocabulary_id = 'mimiciv_obs_language'
+      AND (vc.vocabulary_id in ('Language', 'Race', 'Ethnicity'))
+      AND s.value_as_string = vc.concept_name)
+    OR (s.source_vocabulary_id = 'mimiciv_obs_marital'
+      AND vc.vocabulary_id = 'mimiciv_obs_marital'
+      AND s.value_as_string = vc.concept_name)
+    OR (s.source_vocabulary_id = 'mimiciv_obs_insurance'
+      AND vc.vocabulary_id = 'mimiciv_obs_insurance'
+      AND s.value_as_string = vc.concept_name)
+   )
+
+  LEFT JOIN @etl_project.@etl_dataset.voc_concept_relationship vcr
+    ON vc.concept_id = vcr.concept_id_1
+   AND vcr.relationship_id = 'Maps to'
+   AND vcr.invalid_reason IS NULL
+
+  LEFT JOIN @etl_project.@etl_dataset.voc_concept vc2
+    ON vc2.concept_id = vcr.concept_id_2
+   AND vc2.standard_concept = 'S'
+   AND vc2.invalid_reason IS NULL
+)
+
 SELECT DISTINCT
-    src.value_as_string         AS source_code,
-    src.source_vocabulary_id    AS source_vocabulary_id,
-    vc.domain_id                AS source_domain_id,
-    vc.concept_id               AS source_concept_id,
-    vc2.domain_id               AS target_domain_id,
-    vc2.concept_id              AS target_concept_id
-FROM
-    @etl_project.@etl_dataset.lk_observation_clean src
-LEFT JOIN
-    @etl_project.@etl_dataset.voc_concept vc
-        ON src.value_as_string = vc.concept_code
-        AND src.source_vocabulary_id = vc.vocabulary_id
-        -- valid period should be used to map drg_code, but due to the date shift it is not applicable
-        -- AND src.start_datetime BETWEEN vc.valid_start_date AND vc.valid_end_date
-LEFT JOIN
-    @etl_project.@etl_dataset.voc_concept_relationship vcr
-        ON  vc.concept_id = vcr.concept_id_1
-        AND vcr.relationship_id = 'Maps to'
-LEFT JOIN
-    @etl_project.@etl_dataset.voc_concept vc2
-        ON vc2.concept_id = vcr.concept_id_2
-        AND vc2.standard_concept = 'S'
-        AND vc2.invalid_reason IS NULL
-;
+  source_code,
+  source_value,
+  source_vocabulary_id,
+  source_domain_id,
+  source_concept_id,
+  target_domain_id,
+  target_concept_id
+FROM mapped;
 
 -- -------------------------------------------------------------------
 -- lk_observation_mapped
@@ -182,6 +243,24 @@ FROM
     @etl_project.@etl_dataset.lk_observation_clean src
 LEFT JOIN
     @etl_project.@etl_dataset.lk_obs_admissions_concept lc
-        ON src.value_as_string = lc.source_code
-        AND src.source_vocabulary_id = lc.source_vocabulary_id
+    ON (
+        src.source_vocabulary_id = 'mimiciv_obs_drgcodes'
+        AND lc.source_vocabulary_id = 'mimiciv_obs_drgcodes'
+        AND src.source_code = lc.source_code
+        )
+    OR (
+        src.source_vocabulary_id = 'mimiciv_obs_language'
+        AND lc.source_vocabulary_id = 'mimiciv_obs_language'
+        AND src.value_as_string = lc.source_value
+        )
+    OR (
+        src.source_vocabulary_id = 'mimiciv_obs_marital'
+        AND lc.source_vocabulary_id = 'mimiciv_obs_marital'
+        AND src.value_as_string = lc.source_value
+        )
+    OR (
+        src.source_vocabulary_id = 'mimiciv_obs_insurance'
+        AND lc.source_vocabulary_id = 'mimiciv_obs_insurance'
+        AND src.value_as_string = lc.source_value
+        )
 ;
