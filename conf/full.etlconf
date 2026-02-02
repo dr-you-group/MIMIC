@@ -3,27 +3,27 @@
 
     "variables": 
     {
-        "@source_project":   "physionet-data",
+        "@source_project":   "omoped-mimic",
         "@core_dataset":     "mimiciv_hosp",
         "@hosp_dataset":     "mimiciv_hosp",
         "@icu_dataset":      "mimiciv_icu",
 
-        "@voc_project": "odysseus-mimic-dev",
-        "@voc_dataset": "vocab_schema",
+        "@voc_project": "omoped-mimic",
+        "@voc_dataset": "vocabulary_2026_01_19",
 
-        "@wf_project": "odysseus-mimic-dev",
+        "@wf_project": "omoped-mimic",
         "@wf_dataset": "waveform_source_poc",
 
-        "@etl_project": "odysseus-mimic-dev",
-        "@etl_dataset": "mimiciv_full_cdm_*",
+        "@etl_project": "omoped-mimic",
+        "@etl_dataset": "mimiciv_full_cdm_5_3_1",
 
-        "@metrics_project": "odysseus-mimic-dev",
-        "@metrics_dataset": "mimiciv_full_metrics_*",
+        "@metrics_project": "omoped-mimic",
+        "@metrics_dataset": "mimiciv_full_metrics_5_3_1",
 
-        "@atlas_project": "odysseus-mimic-dev",
-        "@atlas_dataset": "mimiciv_full_current_cdm_*",
+        "@atlas_project": "omoped-mimic",
+        "@atlas_dataset": "mimiciv_full_current_cdm_5_3_1",
 
-        "@waveforms_csv_path":  "gs://bucket..."
+        "@waveforms_csv_path":  "gs://xxx/waveform"  #put your bucket address
 
     },
 
