@@ -1,0 +1,268 @@
+"""Isolated PostgreSQL integration tests and BigQuery runner contract tests.
+
+Run: python -m unittest discover -s test/note -v
+Requires Docker and the postgres:16 image. No production DB is contacted.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import uuid
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def note_id(table, source_id):
+    key = f"mimic-iv-note|{table}|{source_id}".encode("utf-8")
+    return int(hashlib.sha256(key).hexdigest()[:15], 16)
+
+
+class PostgresNoteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("docker"):
+            raise RuntimeError("Docker is required; integration tests must not silently skip")
+        cls.container = "mimic-note-test-" + uuid.uuid4().hex[:10]
+        subprocess.run([
+            "docker", "run", "-d", "--rm", "--network", "none", "--name", cls.container,
+            "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+            "--mount", f"type=bind,src={ROOT},dst=/work,readonly", "postgres:16"
+        ], check=True, stdout=subprocess.DEVNULL)
+        cls.addClassCleanup(lambda: subprocess.run(
+            ["docker", "rm", "-f", cls.container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        for _ in range(60):
+            if subprocess.run(["docker", "exec", cls.container, "pg_isready", "-U", "postgres"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                return
+            time.sleep(0.5)
+        raise RuntimeError("Test PostgreSQL did not become ready")
+
+    def sql(self, sql):
+        result = subprocess.run([
+            "docker", "exec", "-i", self.container, "psql", "-X", "-qAt",
+            "-U", "postgres", "-v", "ON_ERROR_STOP=1"
+        ], input=sql, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def run_etl(self, table="discharge", success=True):
+        result = subprocess.run([
+            "docker", "exec", self.container, "psql", "-X", "-qAt", "-U", "postgres",
+            "-v", "source_schema=raw", "-v", "cdm_schema=cdm", "-v", "etl_schema=note_audit",
+            "-v", "source_table=" + table, "-f", "/work/etl/postgres/note.sql"
+        ], text=True, capture_output=True)
+        if not success:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            return result
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reports = [line.removeprefix("NOTE_ETL_REPORT ") for line in result.stdout.splitlines()
+                   if line.startswith("NOTE_ETL_REPORT ")]
+        self.assertEqual(len(reports), 1, result.stdout)
+        return json.loads(reports[0])
+
+    def setUp(self):
+        self.sql("""
+            DROP SCHEMA IF EXISTS raw CASCADE;
+            DROP SCHEMA IF EXISTS cdm CASCADE;
+            DROP SCHEMA IF EXISTS note_audit CASCADE;
+            CREATE SCHEMA raw; CREATE SCHEMA cdm;
+            CREATE TABLE cdm.person(person_id bigint PRIMARY KEY, person_source_value text);
+            CREATE TABLE cdm.visit_occurrence(
+                visit_occurrence_id bigint PRIMARY KEY, person_id bigint, visit_source_value text);
+            CREATE TABLE cdm.concept(concept_id integer, domain_id text, vocabulary_id text,
+                concept_code text, standard_concept text, invalid_reason text,
+                valid_start_date date DEFAULT '1970-01-01', valid_end_date date DEFAULT '2099-12-31');
+            INSERT INTO cdm.concept(concept_id,domain_id,vocabulary_id,concept_code,standard_concept) VALUES
+                (32817,'Type Concept','Type Concept','EHR','S'),
+                (32678,'Metadata','Metadata','UTF8','S'),
+                (4180186,'Language','SNOMED','297487008','S'),
+                (3020091,'Note','LOINC','18842-5','S'),
+                (40771183,'Note','LOINC','68604-8','S');
+            INSERT INTO cdm.person VALUES (1125899906842625,'101'),(-1099511627776,'102');
+            INSERT INTO cdm.visit_occurrence VALUES
+                (2251799813685249,1125899906842625,'101|201'),
+                (-2199023255552,-1099511627776,'102|301');
+            CREATE TABLE cdm.note (
+                note_id integer PRIMARY KEY, person_id integer NOT NULL,
+                note_date date NOT NULL, note_datetime timestamp, note_type_concept_id integer NOT NULL,
+                note_class_concept_id integer NOT NULL, note_title varchar(250), note_text text NOT NULL,
+                encoding_concept_id integer NOT NULL, language_concept_id integer NOT NULL,
+                provider_id integer, visit_occurrence_id integer, visit_detail_id integer,
+                note_source_value varchar(50));
+            CREATE TABLE cdm.note_nlp(note_nlp_id integer PRIMARY KEY, note_id integer);
+            CREATE TABLE raw.discharge (
+                note_id text PRIMARY KEY, subject_id integer, hadm_id integer, note_type text,
+                note_seq integer, charttime timestamp, storetime timestamp, text text);
+            CREATE TABLE raw.radiology (LIKE raw.discharge INCLUDING ALL);
+            CREATE TABLE raw.discharge_detail (
+                note_id text, subject_id integer, field_name text, field_value text, field_ordinal integer);
+            CREATE TABLE raw.radiology_detail (LIKE raw.discharge_detail);
+            INSERT INTO raw.discharge VALUES
+                ('101-DS-1',101,201,'DS',1,'2100-01-01 12:34:56.123456','2100-01-02',
+                 E'UTF-8 한글, commas\\r\\n  spaces\\nfinal line  '),
+                ('101-DS-2',101,202,'DS',2,'2100-01-03','2100-01-01','Unmatched visit'),
+                ('999-DS-1',999,900,'DS',1,'2100-01-01',NULL,'Missing person'),
+                ('102-AD-1',102,301,'AD',1,'2100-01-04',NULL,'Discharge addendum');
+            INSERT INTO raw.discharge_detail VALUES
+                ('101-DS-1',101,'author','Anonymous author',1),
+                ('101-DS-1',101,'author','Anonymous author',1),
+                ('999-DS-1',999,'author','Rejected document author',1);
+            INSERT INTO raw.radiology VALUES
+                ('101-RR-1',101,NULL,'RR',1,'2100-01-01',NULL,E'Radiology\\nreport'),
+                ('101-AR-1',101,201,'AR',1,'2100-01-02','2100-01-03','Radiology addendum');
+            INSERT INTO raw.radiology_detail VALUES
+                ('101-RR-1',101,'exam_name','Synthetic image study',1),
+                ('101-AR-1',101,'parent_note_id','101-RR-1',1);
+        """)
+
+    def test_incremental_sources_exact_text_and_idempotence(self):
+        first = self.run_etl()
+        self.assertEqual((first["source_rows"], first["loaded_rows"], first["rejected_person_rows"],
+                          first["missing_visit_rows"], first["detail_rows"], first["changed_note_rows"]),
+                         (4, 3, 1, 1, 3, 3))
+        expected_id = note_id("discharge", "101-DS-1")
+        self.assertEqual(self.sql("SELECT note_id FROM note_audit.note_id_map "
+                                  "WHERE source_note_id='101-DS-1'"), str(expected_id))
+        self.assertEqual(self.sql(f"SELECT n.note_text=s.text FROM cdm.note n "
+                                  f"JOIN raw.discharge s ON s.note_id='101-DS-1' WHERE n.note_id={expected_id}"), "t")
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.note_detail "
+                                  "WHERE source_note_id='101-DS-1'"), "2")
+        radiology = self.run_etl("radiology")
+        self.assertEqual((radiology["loaded_rows"], radiology["no_hadm_rows"]), (2, 1))
+        rerun = self.run_etl()
+        self.assertEqual(rerun["changed_note_rows"], 0)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), "5")
+        self.assertEqual(self.sql("SELECT count(DISTINCT note_id) FROM cdm.note"), "5")
+        self.assertEqual(self.sql("SELECT note_class_concept_id FROM cdm.note "
+                                  "WHERE note_source_value='RR'"), "40771183")
+
+    def test_join_fanout_is_rejected(self):
+        self.sql("INSERT INTO cdm.visit_occurrence VALUES (8888,1125899906842625,'101|201')")
+        result = self.run_etl(success=False)
+        self.assertIn("no_join_fanout", result.stderr)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), "0")
+
+    def test_invalid_document_concept_is_rejected(self):
+        self.sql("UPDATE cdm.concept SET domain_id='Observation' WHERE concept_code='18842-5'")
+        self.assertIn("document_class_mapping", self.run_etl(success=False).stderr)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), "0")
+
+    def test_unowned_note_id_collision_is_rejected(self):
+        value = note_id("discharge", "101-DS-1")
+        self.sql(f"""ALTER TABLE cdm.note ALTER COLUMN note_id TYPE bigint;
+            INSERT INTO cdm.note(note_id,person_id,note_date,note_type_concept_id,
+                note_class_concept_id,note_text,encoding_concept_id,language_concept_id)
+            VALUES ({value},1,'2100-01-01',32817,3020091,'Other ETL',32678,4180186)""")
+        self.assertIn("no_unowned_target_id_collision", self.run_etl(success=False).stderr)
+        self.assertEqual(self.sql("SELECT note_text FROM cdm.note"), "Other ETL")
+
+    def test_integrity_failure_rolls_back_data_and_type_migration(self):
+        self.sql("""CREATE FUNCTION cdm.corrupt_test_text() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN NEW.note_text := 'corrupted'; RETURN NEW; END $$;
+            CREATE TRIGGER corrupt_test BEFORE INSERT ON cdm.note
+            FOR EACH ROW EXECUTE FUNCTION cdm.corrupt_test_text();""")
+        self.assertIn("every_loaded_field_matches", self.run_etl(success=False).stderr)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), "0")
+        self.assertEqual(self.sql("SELECT data_type FROM information_schema.columns "
+                                  "WHERE table_schema='cdm' AND table_name='note' AND column_name='note_id'"),
+                         "integer")
+        self.assertEqual(self.sql("SELECT count(*) FROM pg_namespace WHERE nspname='note_audit'"), "0")
+
+    def test_source_deletions_require_explicit_reconciliation(self):
+        self.run_etl()
+        self.sql("DELETE FROM raw.discharge_detail WHERE note_id='101-DS-1';"
+                 "DELETE FROM raw.discharge WHERE note_id='101-DS-1'")
+        self.assertIn("no_implicit_source_deletions", self.run_etl(success=False).stderr)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), "3")
+
+    def test_detail_subject_mismatch_is_rejected(self):
+        self.sql("UPDATE raw.discharge_detail SET subject_id=102 WHERE note_id='101-DS-1'")
+        self.assertIn("detail_parent_and_subject", self.run_etl(success=False).stderr)
+
+
+class BigQueryRunnerTests(unittest.TestCase):
+    def execute(self, script_mode, fail=False, real_workflow=False):
+        with tempfile.TemporaryDirectory(prefix="note-bq-runner-") as folder:
+            root = Path(folder)
+            executable = root / "bq"
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport json,os,sys\n"
+                "query=sys.stdin.read() if len(sys.argv)==3 else sys.argv[-1]\n"
+                "with open(os.environ['BQ_TEST_LOG'],'a') as f: "
+                "f.write(json.dumps(query)+'\\n')\n"
+                "sys.exit(int(os.environ.get('BQ_TEST_EXIT','0')))\n")
+            executable.chmod(0o700)
+            script = root / "first.sql"
+            script.write_text("CREATE TEMP TABLE t AS SELECT '@value' AS x;\nSELECT * FROM t;\n")
+            second = root / "second.sql"
+            second.write_text("SELECT 'must not run after failure';")
+            config = root / "workflow.json"
+            workflow = {"script_mode": script_mode, "variables": {"@value": "literal"},
+                        "scripts": [{"script": str(script)}, {"script": str(second)}]}
+            if real_workflow:
+                workflow = json.loads((ROOT / "conf/workflow_note.conf").read_text())
+                workflow["variables"] = json.loads((ROOT / "conf/note.etlconf").read_text())["variables"]
+            config.write_text(json.dumps(workflow))
+            env = os.environ.copy()
+            env.update(PATH=str(root) + os.pathsep + env["PATH"], BQ_TEST_LOG=str(root / "queries.jsonl"),
+                       BQ_TEST_EXIT="7" if fail else "0")
+            result = subprocess.run([sys.executable, "scripts/run_workflow.py", "-c", str(config)],
+                                    cwd=ROOT, env=env, text=True, capture_output=True)
+            queries = [json.loads(line) for line in (root / "queries.jsonl").read_text().splitlines()]
+            return result, queries
+
+    def test_script_mode_keeps_transaction_and_temporary_table_session(self):
+        result, queries = self.execute(True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(queries), 1)
+        self.assertIn("CREATE TEMP TABLE t AS SELECT 'literal' AS x;\nSELECT * FROM t;", queries[0])
+        self.assertIn("SELECT 'must not run after failure';", queries[0])
+
+    def test_script_failure_reaches_workflow_caller(self):
+        result, queries = self.execute(True, fail=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(len(queries), 1)
+
+    def test_legacy_mode_still_executes_individual_statements(self):
+        result, queries = self.execute(False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(queries), 3)
+
+    def test_legacy_failure_reaches_workflow_caller(self):
+        result, queries = self.execute(False, fail=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(len(queries), 1)
+
+    def test_real_note_workflow_renders_one_atomic_script(self):
+        result, queries = self.execute(True, real_workflow=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(queries), 1)
+        for query in queries:
+            self.assertNotIn("@note_", query)
+            self.assertNotIn("@etl_", query)
+        self.assertIn("mimic-iv-note|", queries[0])
+        query = queries[0]
+        self.assertEqual(query.count("BEGIN TRANSACTION;"), 1)
+        self.assertEqual(query.count("COMMIT TRANSACTION;"), 1)
+        ordered = [
+            "CREATE OR REPLACE TABLE YOUR_ETL_PROJECT.YOUR_EXISTING_ETL_DATASET.src_note AS",
+            "CREATE OR REPLACE TABLE YOUR_ETL_PROJECT.YOUR_EXISTING_ETL_DATASET.lk_note_mapped AS",
+            "CREATE TABLE IF NOT EXISTS YOUR_ETL_PROJECT.YOUR_EXISTING_ETL_DATASET.ext_note_id_map",
+            "BEGIN TRANSACTION;",
+            "INSERT INTO YOUR_ETL_PROJECT.YOUR_EXISTING_ETL_DATASET.cdm_note",
+            "INSERT INTO YOUR_ETL_PROJECT.YOUR_EXISTING_ETL_DATASET.ext_note_metadata",
+            "AS 'Loaded NOTE differs from source or mapping'",
+            "COMMIT TRANSACTION;",
+        ]
+        positions = [query.index(fragment) for fragment in ordered]
+        self.assertEqual(positions, sorted(positions))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -15,6 +15,7 @@ import datetime
 # ----------------------------------------------------
 
 config_default = {
+    "script_mode": False,
 
     "variables": {
 
@@ -237,32 +238,47 @@ def main():
         s_done = []
         s_done.append(nice_message('start...', 0, ''))
 
-        for s_filename in params['script_files']:
-
-            print('Run script {file}\n'.format(file=s_filename))
-
-            s_queries = open(s_filename).read().split(';')
-            s_queries = trim_queries(s_queries)
+        if config['script_mode']:
+            # The ordered NOTE files share one transaction and BigQuery session.
+            # Read all inputs first; pass the complete script through stdin.
+            import subprocess
+            script_config = dict(config, escaping_chars={})
+            rendered_scripts = []
+            for s_filename in params['script_files']:
+                with open(s_filename, encoding='utf-8') as script:
+                    rendered_scripts.append(
+                        '-- File: ' + s_filename + '\n' + format_query(script.read(), script_config))
+            rc = subprocess.run(
+                ['bq', 'query', '--use_legacy_sql=false'],
+                input='\n\n'.join(rendered_scripts), text=True
+            ).returncode
+            s_done.append(nice_message('combined script', rc, ''))
+        else:
+            for s_filename in params['script_files']:
+                print('Run script {file}\n'.format(file=s_filename))
+                s_queries = open(s_filename).read().split(';')
+                s_queries = trim_queries(s_queries)
             
-            query_no = 0
-            for s_query in s_queries:
+                query_no = 0
+                for s_query in s_queries:
 
-                bqc = bq_command.format(
-                    query=troubleshooting_bqc_format(format_query(s_query, config))
-                )
-                query_no += 1
-                print('Starting query...')
+                    bqc = bq_command.format(
+                        query=troubleshooting_bqc_format(format_query(s_query, config))
+                    )
+                    query_no += 1
+                    print('Starting query...')
 
-                rc = os.system(bqc)
+                    import subprocess
+                    rc = subprocess.run(bqc, shell=True).returncode
+
+                    if rc != 0:
+                        break
+            
+                s_done.append(
+                    nice_message(s_filename, rc, '' if rc==0 else 'See query No {0}'.format(query_no)))
 
                 if rc != 0:
                     break
-            
-            s_done.append(
-                nice_message(s_filename, rc, '' if rc==0 else 'See query No {0}'.format(query_no)))
-
-            if rc != 0:
-                break
 
         print('\nScripts executed:')
         for a in s_done:

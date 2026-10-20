@@ -6,6 +6,11 @@ The project implements an ETL conversion of MIMIC IV PhysioNet dataset to OMOP C
 
 * Version 1.0.0
 
+Optional MIMIC-IV-Note support is documented in
+[NOTE ETL](docs/note_etl.md). It adds a source-specific BigQuery workflow and
+equivalent PostgreSQL queries for an existing CDM, preserving Core person and
+visit identifiers.
+
 
 ## Concepts / Philosophy
 
