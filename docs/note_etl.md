@@ -199,6 +199,10 @@ use a fake `bq` executable to verify the combined script order, transaction
 boundaries, and error propagation.
 They do not constitute execution of the SQL on the BigQuery service.
 
+Availability and proposed mappings for CXR, ECG, and Echo are documented in
+[Modality notes](modality_notes.md). That assessment does not enable additional
+source types in the current discharge/radiology workflow.
+
 References: [OMOP NOTE](https://ohdsi.github.io/CommonDataModel/cdm54.html#note),
 [MIMIC-IV-Note](https://mimic.mit.edu/docs/iv/modules/note/),
 [LOINC 18842-5](https://loinc.org/18842-5/),
