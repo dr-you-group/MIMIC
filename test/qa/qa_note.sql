@@ -35,6 +35,14 @@ ASSERT (
 -- Compare all detail fields, including duplicate rows
 -- -------------------------------------------------------------------
 ASSERT NOT EXISTS (
+    SELECT 1 FROM @etl_project.@etl_dataset.ext_note_detail det
+    LEFT JOIN @etl_project.@etl_dataset.lk_note_mapped src
+        ON src.source_note_id = det.source_note_id
+    WHERE det.source_table = '@note_source_table'
+      AND det.note_id IS DISTINCT FROM src.note_id
+) AS 'Incorrect detail NOTE link';
+
+ASSERT NOT EXISTS (
     WITH source_groups AS (
         SELECT source_note_id, subject_id, field_name, field_value, field_ordinal, COUNT(*) AS n
         FROM @etl_project.@etl_dataset.src_note_detail GROUP BY 1,2,3,4,5
@@ -62,11 +70,18 @@ ASSERT NOT EXISTS (
 -- -------------------------------------------------------------------
 
 INSERT INTO @etl_project.@etl_dataset.ext_note_etl_run
+(
+    run_id, finished_at, source_table, source_version, source_sha256,
+    source_rows, loaded_rows, rejected_person_rows, missing_visit_rows,
+    no_hadm_rows, detail_rows, text_mismatches, unmatched_detail_rows
+)
 SELECT GENERATE_UUID(), CURRENT_TIMESTAMP(), '@note_source_table', '@note_source_version',
     NULLIF('@note_source_sha256', ''), COUNT(*), COUNTIF(load_status = 'LOADED'),
     COUNTIF(load_status = 'MISSING_PERSON'), COUNTIF(visit_status = 'MISSING_VISIT'),
     COUNTIF(visit_status = 'NO_HADM_ID'),
-    (SELECT COUNT(*) FROM @etl_project.@etl_dataset.src_note_detail), 0
+    (SELECT COUNT(*) FROM @etl_project.@etl_dataset.src_note_detail), 0,
+    (SELECT COUNT(*) FROM @etl_project.@etl_dataset.ext_note_detail
+     WHERE source_table = '@note_source_table' AND note_id IS NULL)
 FROM @etl_project.@etl_dataset.lk_note_mapped;
 COMMIT TRANSACTION;
 

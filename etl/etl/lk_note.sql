@@ -102,10 +102,10 @@ ASSERT NOT EXISTS (
 ASSERT NOT EXISTS (
     SELECT 1
     FROM @etl_project.@etl_dataset.src_note_detail det
-    LEFT JOIN @etl_project.@etl_dataset.src_note src
-        ON src.source_note_id = det.source_note_id AND src.subject_id = det.subject_id
-    WHERE src.source_note_id IS NULL
-) AS 'Detail parent or subject mismatch'
+    INNER JOIN @etl_project.@etl_dataset.src_note src
+        ON src.source_note_id = det.source_note_id
+    WHERE src.subject_id IS DISTINCT FROM det.subject_id
+) AS 'Detail subject mismatch for an available parent'
 ;
 ASSERT (SELECT COUNT(*) FROM @etl_project.@etl_dataset.lk_note_mapped) =
     (SELECT COUNT(*) FROM @etl_project.@etl_dataset.src_note)

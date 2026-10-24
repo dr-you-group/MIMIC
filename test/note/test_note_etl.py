@@ -197,6 +197,20 @@ class PostgresNoteTests(unittest.TestCase):
         self.sql("UPDATE raw.discharge_detail SET subject_id=102 WHERE note_id='101-DS-1'")
         self.assertIn("detail_parent_and_subject", self.run_etl(success=False).stderr)
 
+    def test_details_without_source_document_are_retained_without_a_fake_note(self):
+        self.sql("""INSERT INTO raw.radiology_detail VALUES
+            ('999-RR-999',999,'exam_name','Unavailable document',1),
+            ('999-RR-999',999,'exam_name','Unavailable document',1);""")
+        result = self.run_etl('radiology')
+        self.assertEqual((result['detail_rows'], result['unmatched_detail_rows']), (4, 2))
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.note_detail "
+                                  "WHERE source_note_id='999-RR-999' AND note_id IS NULL"), '2')
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.note_id_map "
+                                  "WHERE source_note_id='999-RR-999'"), '0')
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note"), '2')
+        repeat = self.run_etl('radiology')
+        self.assertEqual((repeat['changed_note_rows'], repeat['unmatched_detail_rows']), (0, 2))
+
 
 class BigQueryRunnerTests(unittest.TestCase):
     def execute(self, script_mode, fail=False, real_workflow=False):

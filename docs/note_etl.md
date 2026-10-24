@@ -61,6 +61,13 @@ link status, and mapped IDs. The detail table preserves all five original
 fields and duplicate multiplicity. It is not joined into NOTE to create
 additional documents. Anonymous author placeholders are not provider IDs.
 
+Some published detail rows refer to a source document whose body is absent.
+Retain all five raw fields and their duplicate multiplicity with a NULL
+`note_detail.note_id` for those rows. Do not create a NOTE, person, or document
+ID-map entry from a detail reference alone. `unmatched_detail_rows` records
+the count for each run. A subject mismatch for an available parent remains
+a validation failure. QA checks both raw-field equality and document linkage.
+
 PostgreSQL audit tables live in the selected `etl_schema`:
 
 - `note_id_map`: permanent raw-to-CDM document identifier map.

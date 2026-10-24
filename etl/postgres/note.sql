@@ -167,8 +167,8 @@ INSERT INTO note_checks VALUES
     )),
     ('detail_parent_and_subject', NOT EXISTS (
         SELECT 1 FROM :"source_schema".:"detail_table" d
-        LEFT JOIN src_note s ON s.source_note_id = d.note_id AND s.subject_id = d.subject_id
-        WHERE s.source_note_id IS NULL
+        INNER JOIN src_note s ON s.source_note_id = d.note_id
+        WHERE s.subject_id IS DISTINCT FROM d.subject_id
     ));
 CREATE UNIQUE INDEX ON lk_note_mapped(source_note_id);
 CREATE UNIQUE INDEX ON lk_note_mapped(note_id);
@@ -209,12 +209,13 @@ CREATE TABLE IF NOT EXISTS :"etl_schema".note_metadata (
 CREATE TABLE IF NOT EXISTS :"etl_schema".note_detail (
     source_table text NOT NULL,
     source_note_id text NOT NULL,
-    note_id bigint NOT NULL,
+    note_id bigint,
     subject_id integer NOT NULL,
     field_name text NOT NULL,
     field_value text NOT NULL,
     field_ordinal integer NOT NULL
 );
+ALTER TABLE :"etl_schema".note_detail ALTER COLUMN note_id DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS note_detail_note_id_idx ON :"etl_schema".note_detail(note_id);
 CREATE TABLE IF NOT EXISTS :"etl_schema".note_etl_run (
     run_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -230,8 +231,11 @@ CREATE TABLE IF NOT EXISTS :"etl_schema".note_etl_run (
     detail_rows bigint NOT NULL,
     changed_note_rows bigint NOT NULL,
     text_mismatches bigint NOT NULL,
-    passed_checks bigint NOT NULL
+    passed_checks bigint NOT NULL,
+    unmatched_detail_rows bigint NOT NULL DEFAULT 0
 );
+ALTER TABLE :"etl_schema".note_etl_run
+    ADD COLUMN IF NOT EXISTS unmatched_detail_rows bigint NOT NULL DEFAULT 0;
 
 -- -------------------------------------------------------------------
 -- Check ownership of existing note identifiers
@@ -387,7 +391,7 @@ DELETE FROM :"etl_schema".note_detail WHERE source_table = :'source_table';
 
 INSERT INTO :"etl_schema".note_detail
 SELECT
-    src.source_table                            AS source_table,
+    :'source_table'::text                        AS source_table,
     det.note_id                                 AS source_note_id,
     src.note_id                                 AS note_id,
     det.subject_id                              AS subject_id,
@@ -396,7 +400,7 @@ SELECT
     det.field_ordinal                           AS field_ordinal
 FROM
     :"source_schema".:"detail_table" det
-INNER JOIN
+LEFT JOIN
     lk_note_mapped src
         ON src.source_note_id = det.note_id
 ;
@@ -430,6 +434,12 @@ INSERT INTO note_checks VALUES
         SELECT count(*) FROM :"cdm_schema".note n
         JOIN :"etl_schema".note_id_map m USING (note_id) WHERE m.source_table = :'source_table'
     ) = (SELECT count(*) FROM lk_note_mapped WHERE person_id IS NOT NULL)),
+    ('detail_note_links_match', NOT EXISTS (
+        SELECT 1 FROM :"etl_schema".note_detail d
+        LEFT JOIN lk_note_mapped s ON s.source_note_id = d.source_note_id
+        WHERE d.source_table = :'source_table'
+          AND d.note_id IS DISTINCT FROM s.note_id
+    )),
     ('all_detail_rows_preserved', NOT EXISTS (
         (SELECT note_id, subject_id, field_name, field_value, field_ordinal
          FROM :"source_schema".:"detail_table"
@@ -451,7 +461,7 @@ INSERT INTO note_checks VALUES
 INSERT INTO :"etl_schema".note_etl_run (
     finished_at, source_table, source_version, source_sha256, source_rows, loaded_rows,
     rejected_person_rows, missing_visit_rows, no_hadm_rows, detail_rows, changed_note_rows,
-    text_mismatches, passed_checks
+    text_mismatches, passed_checks, unmatched_detail_rows
 )
 SELECT clock_timestamp(), :'source_table', :'source_version', NULLIF(:'source_sha256', ''),
     count(*), count(*) FILTER (WHERE load_status = 'LOADED'),
@@ -460,7 +470,9 @@ SELECT clock_timestamp(), :'source_table', :'source_version', NULLIF(:'source_sh
     count(*) FILTER (WHERE visit_status = 'NO_HADM_ID'),
     (SELECT count(*) FROM :"source_schema".:"detail_table"),
     (SELECT count(*) FROM note_changed), (SELECT count(*) FROM note_differences),
-    (SELECT count(*) FROM note_checks)
+    (SELECT count(*) FROM note_checks),
+    (SELECT count(*) FROM :"etl_schema".note_detail
+     WHERE source_table = :'source_table' AND note_id IS NULL)
 FROM lk_note_mapped
 RETURNING run_id \gset
 ANALYZE :"cdm_schema".note;

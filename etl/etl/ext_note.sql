@@ -68,7 +68,7 @@ WHERE source_table = '@note_source_table'
 
 INSERT INTO @etl_project.@etl_dataset.ext_note_detail
 SELECT
-    src.source_table                            AS source_table,
+    '@note_source_table'                         AS source_table,
     det.source_note_id                          AS source_note_id,
     src.note_id                                 AS note_id,
     det.subject_id                              AS subject_id,
@@ -77,7 +77,7 @@ SELECT
     det.field_ordinal                           AS field_ordinal
 FROM
     @etl_project.@etl_dataset.src_note_detail det
-INNER JOIN
+LEFT JOIN
     @etl_project.@etl_dataset.lk_note_mapped src
         ON src.source_note_id = det.source_note_id
 ;

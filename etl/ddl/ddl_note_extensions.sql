@@ -40,13 +40,23 @@ CREATE TABLE IF NOT EXISTS @etl_project.@etl_dataset.ext_note_detail
 (
     source_table                STRING       NOT NULL,
     source_note_id              STRING       NOT NULL,
-    note_id                     INT64        NOT NULL,
+    note_id                     INT64,
     subject_id                  INT64        NOT NULL,
     field_name                  STRING       NOT NULL,
     field_value                 STRING       NOT NULL,
     field_ordinal               INT64        NOT NULL
 )
 ;
+-- Some published detail rows refer to documents absent from the note source.
+-- Preserve those rows with a NULL CDM link, including on existing tables.
+IF EXISTS (
+    SELECT 1 FROM `@etl_project.@etl_dataset.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = 'ext_note_detail' AND column_name = 'note_id'
+      AND is_nullable = 'NO'
+) THEN
+    ALTER TABLE @etl_project.@etl_dataset.ext_note_detail
+        ALTER COLUMN note_id DROP NOT NULL;
+END IF;
 CREATE TABLE IF NOT EXISTS @etl_project.@etl_dataset.ext_note_etl_run
 (
     run_id                      STRING       NOT NULL,
@@ -60,6 +70,9 @@ CREATE TABLE IF NOT EXISTS @etl_project.@etl_dataset.ext_note_etl_run
     missing_visit_rows          INT64        NOT NULL,
     no_hadm_rows                INT64        NOT NULL,
     detail_rows                 INT64        NOT NULL,
-    text_mismatches             INT64        NOT NULL
+    text_mismatches             INT64        NOT NULL,
+    unmatched_detail_rows       INT64
 )
 ;
+ALTER TABLE @etl_project.@etl_dataset.ext_note_etl_run
+    ADD COLUMN IF NOT EXISTS unmatched_detail_rows INT64;
