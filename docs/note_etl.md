@@ -157,9 +157,12 @@ If available, pass the verified source file checksum using
 later radiology load; its detail table name is derived automatically.
 
 The transaction widens NOTE's document, person, visit, and visit-detail IDs
-to BIGINT and widens NOTE_NLP's note reference to BIGINT. Existing constraints
-are retained. Concept IDs remain ordinary integers. A database advisory lock
-serializes this add-on's runs for the same target schema. Repeatable-read
+to BIGINT and widens NOTE_NLP's note reference to BIGINT. Columns already using
+BIGINT are skipped, so incremental loads retain views over the widened tables.
+For an initial type conversion, dependent views must first be preserved and
+recreated with their original definitions and privileges in the same transaction.
+Existing constraints are retained. Concept IDs remain ordinary integers.
+A database advisory lock serializes this add-on's runs for the same target schema. Repeatable-read
 isolation keeps the source and Core mapping snapshot consistent.
 
 The implementation upserts its own notes. An identical rerun changes zero
@@ -176,6 +179,8 @@ parents, identifier collisions, or output differences. Before commit it
 compares every loaded NOTE field, exact UTF-8 text SHA-256 and byte length,
 and the full detail multiset. Missing-person and missing-visit counts are
 reported separately; a nonzero count is not hidden by an inner join.
+PostgreSQL records `finished_at` using wall-clock time at the successful audit
+insert, immediately before ANALYZE and commit, rather than transaction start time.
 
 Dates are preserved even if `storetime < charttime` or storetime is absent.
 Charttime is not a guarantee that the final document was available for a

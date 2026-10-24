@@ -261,13 +261,26 @@ INSERT INTO note_checks VALUES
 -- -------------------------------------------------------------------
 
 -- Core IDs are preserved verbatim; concept IDs remain ordinary integers.
-ALTER TABLE :"cdm_schema".note
-    ALTER COLUMN note_id TYPE bigint,
-    ALTER COLUMN person_id TYPE bigint,
-    ALTER COLUMN visit_occurrence_id TYPE bigint,
-    ALTER COLUMN visit_detail_id TYPE bigint;
--- Standard CDM instances instantiate NOTE_NLP even when it is empty.
-ALTER TABLE :"cdm_schema".note_nlp ALTER COLUMN note_id TYPE bigint;
+-- Skip columns already widened by an earlier load: PostgreSQL rejects even
+-- an unchanged TYPE when a view depends on the column.
+SELECT format(
+    'ALTER TABLE %I.%I ALTER COLUMN %I TYPE bigint',
+    :'cdm_schema', ids.table_name, ids.column_name
+)
+FROM (VALUES
+    ('note', 'note_id'),
+    ('note', 'person_id'),
+    ('note', 'visit_occurrence_id'),
+    ('note', 'visit_detail_id'),
+    ('note_nlp', 'note_id')
+) AS ids(table_name, column_name)
+INNER JOIN pg_attribute attr
+    ON  attr.attrelid = format('%I.%I', :'cdm_schema', ids.table_name)::regclass
+    AND attr.attname = ids.column_name
+    AND NOT attr.attisdropped
+WHERE attr.atttypid <> 'bigint'::regtype
+ORDER BY ids.table_name, ids.column_name
+\gexec
 
 -- -------------------------------------------------------------------
 -- cdm_note
@@ -440,7 +453,7 @@ INSERT INTO :"etl_schema".note_etl_run (
     rejected_person_rows, missing_visit_rows, no_hadm_rows, detail_rows, changed_note_rows,
     text_mismatches, passed_checks
 )
-SELECT CURRENT_TIMESTAMP, :'source_table', :'source_version', NULLIF(:'source_sha256', ''),
+SELECT clock_timestamp(), :'source_table', :'source_version', NULLIF(:'source_sha256', ''),
     count(*), count(*) FILTER (WHERE load_status = 'LOADED'),
     count(*) FILTER (WHERE load_status = 'MISSING_PERSON'),
     count(*) FILTER (WHERE visit_status = 'MISSING_VISIT'),

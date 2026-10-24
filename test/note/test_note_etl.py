@@ -142,6 +142,18 @@ class PostgresNoteTests(unittest.TestCase):
         self.assertEqual(self.sql("SELECT note_class_concept_id FROM cdm.note "
                                   "WHERE note_source_value='RR'"), "40771183")
 
+    def test_incremental_load_preserves_views_on_bigint_ids(self):
+        self.run_etl()
+        self.sql("""CREATE SCHEMA note_views;
+            CREATE VIEW note_views.note AS SELECT * FROM cdm.note WHERE person_id=1125899906842625;
+            CREATE VIEW note_views.note_nlp AS SELECT * FROM cdm.note_nlp;
+        """)
+        self.addCleanup(lambda: self.sql("DROP SCHEMA IF EXISTS note_views CASCADE"))
+        self.assertEqual(self.run_etl("radiology")["loaded_rows"], 2)
+        self.assertEqual(self.run_etl("radiology")["changed_note_rows"], 0)
+        self.assertEqual(self.sql("SELECT count(*) FROM note_views.note"), "4")
+        self.assertEqual(self.sql("SELECT count(*) FROM note_views.note_nlp"), "0")
+
     def test_join_fanout_is_rejected(self):
         self.sql("INSERT INTO cdm.visit_occurrence VALUES (8888,1125899906842625,'101|201')")
         result = self.run_etl(success=False)
