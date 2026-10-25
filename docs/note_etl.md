@@ -10,6 +10,10 @@ The PostgreSQL implementation executes equivalent mapping rules directly
 against an existing database. It does not run or translate the full BigQuery
 pipeline.
 
+CXR and ECG machine sources use canonical SQL views and this same mapping.
+Echo supplies linkage metadata only. See [modality_notes.md](modality_notes.md)
+for adapters, duplicate rules, identity namespaces, quarantine, and execution order.
+
 ## Mapping contract
 
 | NOTE field | Rule |
@@ -31,6 +35,8 @@ pipeline.
 | --- | --- | --- |
 | discharge | DS, AD | 18842-5, Discharge summary |
 | radiology | RR, AR | 68604-8, Radiology Diagnostic Study Note |
+| cxr | CXR (confirmed new documents) | 68604-8, Radiology Diagnostic Study Note |
+| ecg_machine | ECG_MACHINE | 75425-9, Cardiology Diagnostic study note |
 
 Document concepts must be valid, standard LOINC concepts in the Note domain.
 The installed Vocabulary determines their concept IDs. The three constant

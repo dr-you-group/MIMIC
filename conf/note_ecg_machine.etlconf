@@ -1,0 +1,13 @@
+{
+    "comment": "Optional NOTE add-on; run after the existing Core ETL and vocabulary refresh.",
+    "variables": {
+        "@note_project": "YOUR_SOURCE_PROJECT",
+        "@note_dataset": "mimiciv_modality",
+        "@note_source_table": "ecg_machine",
+        "@note_detail_table": "ecg_machine_detail",
+        "@note_source_version": "1.0",
+        "@note_source_sha256": "",
+        "@etl_project": "YOUR_ETL_PROJECT",
+        "@etl_dataset": "YOUR_EXISTING_ETL_DATASET"
+    }
+}

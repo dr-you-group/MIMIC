@@ -49,7 +49,7 @@ CREATE TEMP TABLE note_checks (
     passed boolean NOT NULL CHECK (passed)
 ) ON COMMIT DROP;
 INSERT INTO note_checks VALUES
-    ('supported_source', :'source_table' IN ('discharge', 'radiology'));
+    ('supported_source', :'source_table' IN ('discharge', 'radiology', 'cxr', 'ecg_machine'));
 SELECT :'source_table' || '_detail' AS detail_table \gset
 
 -- -------------------------------------------------------------------
@@ -64,7 +64,9 @@ INSERT INTO lk_note_type VALUES
     ('discharge', 'DS', '18842-5', 'Discharge summary'),
     ('discharge', 'AD', '18842-5', 'Discharge summary addendum'),
     ('radiology', 'RR', '68604-8', 'Radiology report'),
-    ('radiology', 'AR', '68604-8', 'Radiology report addendum');
+    ('radiology', 'AR', '68604-8', 'Radiology report addendum'),
+    ('cxr', 'CXR', '68604-8', 'Chest radiograph report'),
+    ('ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation');
 
 -- -------------------------------------------------------------------
 -- src_note
@@ -77,7 +79,11 @@ SELECT
     :'source_table'::text AS source_table,
     note_id::text AS source_note_id,
     ('x' || substr(encode(sha256(convert_to(
-        'mimic-iv-note|' || :'source_table' || '|' || note_id, 'UTF8'
+        CASE :'source_table'
+            WHEN 'cxr' THEN 'mimic-cxr'
+            WHEN 'ecg_machine' THEN 'mimic-iv-ecg'
+            ELSE 'mimic-iv-note'
+        END || '|' || :'source_table' || '|' || note_id, 'UTF8'
     )), 'hex'), 1, 15))::bit(60)::bigint AS note_id,
     subject_id                              AS subject_id,
     hadm_id                                 AS hadm_id,
@@ -95,7 +101,8 @@ CREATE UNIQUE INDEX ON src_note(note_id);
 ANALYZE src_note;
 
 INSERT INTO note_checks VALUES
-    ('nonempty_source', (SELECT count(*) > 0 FROM src_note)),
+    -- A completely reconciled CXR source can legitimately add zero documents.
+    ('nonempty_source', :'source_table' = 'cxr' OR (SELECT count(*) > 0 FROM src_note)),
     ('source_required_fields', NOT EXISTS (
         SELECT 1 FROM src_note WHERE source_note_id IS NULL OR source_note_id = ''
         OR subject_id IS NULL OR charttime IS NULL OR text_sha256 IS NULL OR text_bytes = 0

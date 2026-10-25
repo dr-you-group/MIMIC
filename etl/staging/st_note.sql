@@ -5,8 +5,8 @@
 -- Dependencies: complete note and matching detail source tables
 -- -------------------------------------------------------------------
 
--- Run one source at a time: discharge or radiology.
-ASSERT '@note_source_table' IN ('discharge', 'radiology')
+-- Modality inputs are canonical views created by st_modality_note.sql.
+ASSERT '@note_source_table' IN ('discharge', 'radiology', 'cxr', 'ecg_machine')
                                                 AS 'Unsupported NOTE source'
 ;
 ASSERT '@note_detail_table' = CONCAT('@note_source_table', '_detail')
@@ -22,7 +22,11 @@ SELECT
     '@note_source_table'                        AS source_table,
     note_id                                     AS source_note_id,
     CAST(CONCAT('0x', SUBSTR(TO_HEX(SHA256(CONCAT(
-        'mimic-iv-note|', '@note_source_table', '|', note_id
+        CASE '@note_source_table'
+            WHEN 'cxr' THEN 'mimic-cxr'
+            WHEN 'ecg_machine' THEN 'mimic-iv-ecg'
+            ELSE 'mimic-iv-note'
+        END, '|', '@note_source_table', '|', note_id
     ))), 1, 15)) AS INT64)                       AS note_id,
     subject_id                                  AS subject_id,
     hadm_id                                     AS hadm_id,
@@ -57,7 +61,7 @@ FROM
 -- -------------------------------------------------------------------
 
 ASSERT (
-    SELECT COUNT(*) > 0
+    SELECT '@note_source_table' = 'cxr' OR COUNT(*) > 0
     FROM @etl_project.@etl_dataset.src_note
 ) AS 'Empty NOTE source'
 ;

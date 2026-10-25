@@ -22,6 +22,10 @@ UNION ALL
 SELECT 'radiology', 'RR', '68604-8', 'Radiology report'
 UNION ALL
 SELECT 'radiology', 'AR', '68604-8', 'Radiology report addendum'
+UNION ALL
+SELECT 'cxr', 'CXR', '68604-8', 'Chest radiograph report'
+UNION ALL
+SELECT 'ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation'
 ;
 
 -- -------------------------------------------------------------------

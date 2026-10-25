@@ -51,10 +51,10 @@ class PostgresNoteTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
-    def run_etl(self, table="discharge", success=True):
+    def run_etl(self, table="discharge", success=True, source_schema="raw"):
         result = subprocess.run([
             "docker", "exec", self.container, "psql", "-X", "-qAt", "-U", "postgres",
-            "-v", "source_schema=raw", "-v", "cdm_schema=cdm", "-v", "etl_schema=note_audit",
+            "-v", "source_schema=" + source_schema, "-v", "cdm_schema=cdm", "-v", "etl_schema=note_audit",
             "-v", "source_table=" + table, "-f", "/work/etl/postgres/note.sql"
         ], text=True, capture_output=True)
         if not success:
@@ -68,6 +68,7 @@ class PostgresNoteTests(unittest.TestCase):
 
     def setUp(self):
         self.sql("""
+            DROP SCHEMA IF EXISTS modality CASCADE;
             DROP SCHEMA IF EXISTS raw CASCADE;
             DROP SCHEMA IF EXISTS cdm CASCADE;
             DROP SCHEMA IF EXISTS note_audit CASCADE;
@@ -211,9 +212,115 @@ class PostgresNoteTests(unittest.TestCase):
         repeat = self.run_etl('radiology')
         self.assertEqual((repeat['changed_note_rows'], repeat['unmatched_detail_rows']), (0, 2))
 
+    def modality_fixture(self):
+        self.run_etl('discharge')
+        self.run_etl('radiology')
+        reports = ','.join(f'report_{i} text' for i in range(18))
+        self.sql(f"""
+            INSERT INTO cdm.concept(concept_id,domain_id,vocabulary_id,concept_code,standard_concept)
+                VALUES (46235236,'Note','LOINC','75425-9','S');
+            CREATE SCHEMA modality;
+            CREATE TABLE modality.source_file(table_name text, source_version text,
+                source_sha256 text, checksum_status text);
+            INSERT INTO modality.source_file
+                SELECT t,'test','synthetic',CASE WHEN t='echo_study_list' THEN 'CHECKSUM_MISMATCH' ELSE 'VERIFIED' END
+                FROM unnest(ARRAY['cxr_reports','cxr_study_list','cxr_record_list','cxr_provider_list',
+                    'cxr_metadata','ecg_machine_measurements','ecg_record_list','ecg_waveform_note_links','echo_study_list']) t;
+            CREATE TABLE modality.cxr_reports(subject_id text,study_id text,text text);
+            INSERT INTO modality.cxr_reports VALUES
+                ('101','501',E'FINAL REPORT\\nRadiology\\nreport'),
+                ('101','502','Unresolved overlap'),
+                ('102','503',E'New UTF-8 한글 CXR\\n  original text '),
+                ('999','504','No CDM person');
+            CREATE TABLE modality.cxr_study_list AS SELECT subject_id,study_id FROM modality.cxr_reports;
+            CREATE TABLE modality.cxr_metadata AS
+                SELECT subject_id,study_id,'21000101'::text AS studydate,'000000.125'::text AS studytime
+                FROM modality.cxr_reports;
+            CREATE TABLE modality.ecg_machine_measurements(subject_id text,study_id text,ecg_time text,{reports});
+            INSERT INTO modality.ecg_machine_measurements(subject_id,study_id,ecg_time,report_0,report_1,report_2) VALUES
+                ('101','601','2100-01-03 01:02:03','Machine first','','Machine third'),
+                ('999','602','2100-01-03 01:02:03','Missing person','',''),
+                ('102','603','2100-01-03 01:02:03','','','');
+            CREATE TABLE modality.echo_study_list(subject_id text,study_id text,study_datetime text,note_id text);
+            INSERT INTO modality.echo_study_list VALUES
+                ('101','701','2100-01-03','101-EC-1'),('999','702','2100-01-03','');
+        """)
+
+    def run_modality(self, filename, success=True):
+        result = subprocess.run([
+            'docker','exec',self.container,'psql','-X','-qAt','-U','postgres',
+            '-v','source_schema=modality','-v','radiology_schema=raw',
+            '-v','cdm_schema=cdm','-v','etl_schema=note_audit',
+            '-f','/work/etl/postgres/'+filename
+        ],text=True,capture_output=True)
+        if success:
+            self.assertEqual(result.returncode,0,result.stderr)
+        else:
+            self.assertNotEqual(result.returncode,0,result.stdout)
+        return result
+
+    def test_modality_incremental_reuse_machine_lines_and_echo_quarantine(self):
+        self.modality_fixture()
+        self.run_modality('st_modality_note.sql')
+        cxr = self.run_etl('cxr',source_schema='modality')
+        ecg = self.run_etl('ecg_machine',source_schema='modality')
+        self.assertEqual((cxr['source_rows'],cxr['loaded_rows']),(2,1))
+        self.assertEqual((ecg['source_rows'],ecg['loaded_rows']),(2,1))
+        self.run_modality('ext_modality_note.sql')
+        self.assertEqual(self.sql('SELECT count(*) FROM cdm.note'),'7')
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note WHERE note_source_value IN ('DS','AD','RR','AR')"),'5')
+        self.assertEqual(self.sql("SELECT load_status FROM note_audit.modality_note_link WHERE study_id=501"),'LINKED_EXISTING')
+        self.assertEqual(self.sql("SELECT load_status FROM note_audit.modality_note_link WHERE study_id=502"),'REVIEW_OVERLAP')
+        self.assertEqual(self.sql("SELECT note_id FROM note_audit.modality_note_link WHERE study_id=501"),str(note_id('radiology','101-RR-1')))
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.modality_note_link WHERE source_table='echo' AND note_id IS NULL AND checksum_status='CHECKSUM_MISMATCH'"),'2')
+        expected = int(hashlib.sha256(b'mimic-iv-ecg|ecg_machine|101-ECG_MACHINE-601').hexdigest()[:15],16)
+        self.assertEqual(self.sql("SELECT note_id FROM cdm.note WHERE note_source_value='ECG_MACHINE'"),str(expected))
+        machine = 'Machine first\n\nMachine third'+'\n'*15
+        expected_hash = hashlib.sha256(machine.encode()).hexdigest()
+        self.assertEqual(self.sql("SELECT encode(sha256(convert_to(note_text,'UTF8')),'hex') FROM cdm.note WHERE note_source_value='ECG_MACHINE'"),expected_hash)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note WHERE note_source_value IN ('CXR','ECG_MACHINE') AND visit_occurrence_id IS NULL AND provider_id IS NULL"),'2')
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.run_etl('cxr',source_schema='modality')['changed_note_rows'],0)
+        self.assertEqual(self.run_etl('ecg_machine',source_schema='modality')['changed_note_rows'],0)
+        self.run_modality('ext_modality_note.sql')
+        self.assertEqual(self.sql('SELECT count(*) FROM note_audit.modality_note_link'),'9')
+
+    def test_cxr_ambiguous_repeated_text_is_not_merged_or_inserted(self):
+        self.modality_fixture()
+        self.sql("""INSERT INTO modality.cxr_reports SELECT subject_id,'505',text FROM modality.cxr_reports WHERE study_id='501';
+            INSERT INTO modality.cxr_study_list VALUES ('101','505');
+            INSERT INTO modality.cxr_metadata VALUES ('101','505','21000101','000000.125');""")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.cxr_reconciliation WHERE study_id IN (501,505) AND decision='REVIEW_OVERLAP'"),'2')
+
+    def test_cxr_clinical_body_requires_exam_time_and_unique_pair(self):
+        self.modality_fixture()
+        body = 'FINDINGS: No acute pulmonary changes; normal cardiomediastinal silhouette.'
+        self.sql(f"""UPDATE raw.radiology SET text='Different indication. {body}',charttime='2100-01-01 00:00:00' WHERE note_id='101-RR-1';
+            UPDATE raw.radiology_detail SET field_value='CHEST (PA AND LAT)' WHERE field_name='exam_name';
+            UPDATE modality.cxr_reports SET text='FINAL REPORT Different deidentification. {body}' WHERE study_id='501';""")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'CLINICAL_BODY_CHEST_WITHIN_1H')
+        self.sql("UPDATE modality.cxr_metadata SET studytime='020000' WHERE study_id='501'")
+        self.assertIn('stable_existing_resolution',self.run_modality('st_modality_note.sql',success=False).stderr)
+
+    def test_zero_new_cxr_documents_is_valid(self):
+        self.modality_fixture()
+        self.sql("DELETE FROM modality.cxr_reports WHERE study_id IN ('503','504'); DELETE FROM modality.cxr_study_list WHERE study_id IN ('503','504');")
+        self.run_modality('st_modality_note.sql')
+        result=self.run_etl('cxr',source_schema='modality')
+        self.assertEqual((result['source_rows'],result['loaded_rows']),(0,0))
+
+    def test_raw_fingerprint_encoding_matches_python(self):
+        row = ['quotes " and \\', '한글\r\n  spaces', '']
+        expected=hashlib.sha256(json.dumps(row,ensure_ascii=False).encode()).hexdigest()
+        actual=self.sql("SELECT encode(sha256(convert_to(jsonb_build_array("+
+            ','.join("'"+v.replace("'","''")+"'::text" for v in row)+")::text,'UTF8')),'hex')")
+        self.assertEqual(actual,expected)
+
 
 class BigQueryRunnerTests(unittest.TestCase):
-    def execute(self, script_mode, fail=False, real_workflow=False):
+    def execute(self, script_mode, fail=False, real_workflow=False, source='discharge'):
         with tempfile.TemporaryDirectory(prefix="note-bq-runner-") as folder:
             root = Path(folder)
             executable = root / "bq"
@@ -232,8 +339,10 @@ class BigQueryRunnerTests(unittest.TestCase):
             workflow = {"script_mode": script_mode, "variables": {"@value": "literal"},
                         "scripts": [{"script": str(script)}, {"script": str(second)}]}
             if real_workflow:
-                workflow = json.loads((ROOT / "conf/workflow_note.conf").read_text())
-                workflow["variables"] = json.loads((ROOT / "conf/note.etlconf").read_text())["variables"]
+                name = 'note' if real_workflow is True else real_workflow
+                workflow = json.loads((ROOT / f"conf/workflow_{name}.conf").read_text())
+                config_name = 'modality_note' if name.startswith('modality') else ('note' if source=='discharge' else 'note_'+source)
+                workflow["variables"] = json.loads((ROOT / f"conf/{config_name}.etlconf").read_text())["variables"]
             config.write_text(json.dumps(workflow))
             env = os.environ.copy()
             env.update(PATH=str(root) + os.pathsep + env["PATH"], BQ_TEST_LOG=str(root / "queries.jsonl"),
@@ -272,7 +381,7 @@ class BigQueryRunnerTests(unittest.TestCase):
         for query in queries:
             self.assertNotIn("@note_", query)
             self.assertNotIn("@etl_", query)
-        self.assertIn("mimic-iv-note|", queries[0])
+        self.assertIn("ELSE 'mimic-iv-note'", queries[0])
         query = queries[0]
         self.assertEqual(query.count("BEGIN TRANSACTION;"), 1)
         self.assertEqual(query.count("COMMIT TRANSACTION;"), 1)
@@ -288,6 +397,22 @@ class BigQueryRunnerTests(unittest.TestCase):
         ]
         positions = [query.index(fragment) for fragment in ordered]
         self.assertEqual(positions, sorted(positions))
+
+    def test_modality_workflows_and_note_sources_render_without_parameters(self):
+        for name in ['modality_note_staging','modality_note_links']:
+            with self.subTest(workflow=name):
+                result,queries=self.execute(True,real_workflow=name)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(len(queries),1)
+                self.assertNotIn('@',queries[0])
+                self.assertEqual(queries[0].count('BEGIN TRANSACTION;'),1)
+                self.assertEqual(queries[0].count('COMMIT TRANSACTION;'),1)
+        for source in ['cxr','ecg_machine']:
+            with self.subTest(source=source):
+                result,queries=self.execute(True,real_workflow=True,source=source)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertNotIn('@',queries[0])
+                self.assertIn('YOUR_SOURCE_PROJECT.mimiciv_modality.'+source,queries[0])
 
 
 if __name__ == "__main__":
