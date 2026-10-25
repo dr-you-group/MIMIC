@@ -1,0 +1,12 @@
+{
+    "comment": "NOTE-only ETL against an existing CDM; raw inputs remain read-only.",
+    "variables": {
+        "@note_project": "YOUR_SOURCE_PROJECT",
+        "@note_dataset": "mimiciv_note",
+        "@note_source_table": "radiology",
+        "@etl_project": "YOUR_ETL_PROJECT",
+        "@etl_dataset": "YOUR_EXISTING_ETL_DATASET",
+        "@radiology_project": "YOUR_SOURCE_PROJECT",
+        "@radiology_dataset": "mimiciv_note"
+    }
+}

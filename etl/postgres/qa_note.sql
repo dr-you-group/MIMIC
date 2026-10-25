@@ -2,9 +2,9 @@
 -- MIMIC IV CDM Conversion
 -- Final NOTE conventions audit across all source modalities
 --
--- Run after all source-specific note.sql checks and modality extensions.
+-- Read-only audit after source-specific note.sql checks.
 -- Targets the shared 14 NOTE fields in CDM 5.3; does not migrate Core to 5.4.
--- Source-specific ETL additionally verifies raw text and every detail row.
+-- Source-specific ETL verifies source hashes; raw detail tables remain unchanged.
 -- -------------------------------------------------------------------
 
 \set ON_ERROR_STOP on
@@ -32,7 +32,7 @@ SELECT
     count(*) FILTER (WHERE n.visit_occurrence_id IS NOT NULL
         AND (v.visit_occurrence_id IS NULL OR v.person_id IS DISTINCT FROM n.person_id)) AS visit_fk_or_person,
     count(*) FILTER (WHERE n.visit_detail_id IS NOT NULL
-        AND (vd.visit_detail_id IS NULL OR vd.person_id IS DISTINCT FROM n.person_id)) AS visit_detail_fk_or_person,
+        AND (vd.visit_detail_id IS NULL OR vd.person_id IS DISTINCT FROM n.person_id OR vd.visit_occurrence_id IS DISTINCT FROM n.visit_occurrence_id)) AS visit_detail_fk_or_person,
     count(*) FILTER (WHERE n.provider_id IS NOT NULL AND pr.provider_id IS NULL) AS provider_fk,
     count(*) FILTER (WHERE doc.concept_id IS NULL) AS document_concept,
     count(*) FILTER (WHERE typ.concept_id IS NULL) AS type_concept,
@@ -65,43 +65,15 @@ LEFT JOIN :"cdm_schema".concept lang ON lang.concept_id = n.language_concept_id
 ), note_convention_checks(check_name, violations) AS MATERIALIZED (
 SELECT key, value::bigint FROM lk_note_convention_counts c, jsonb_each_text(to_jsonb(c))
 UNION ALL
-VALUES
-    ('duplicate_note_id', (SELECT count(*) - count(DISTINCT note_id) FROM :"cdm_schema".note)),
-    ('unowned_note', (SELECT count(*) FROM :"cdm_schema".note n
-        LEFT JOIN :"etl_schema".note_id_map m USING (note_id) WHERE m.note_id IS NULL)),
-    ('source_person_and_visit_mapping', (
-        SELECT count(*) FROM :"etl_schema".note_metadata m
-        INNER JOIN :"cdm_schema".note n USING (note_id)
-        INNER JOIN :"cdm_schema".person p ON p.person_id = n.person_id
-        LEFT JOIN :"cdm_schema".visit_occurrence v ON v.visit_occurrence_id = n.visit_occurrence_id
-        WHERE p.person_source_value IS DISTINCT FROM CAST(m.subject_id AS text)
-          OR n.person_id IS DISTINCT FROM m.person_id
-          OR n.visit_occurrence_id IS DISTINCT FROM m.visit_occurrence_id
-          OR (n.visit_occurrence_id IS NOT NULL AND (m.hadm_id IS NULL
-              OR v.visit_source_value IS DISTINCT FROM CAST(m.subject_id AS text) || '|' || CAST(m.hadm_id AS text)))
-    )),
-    ('eligible_cxr_unloaded', (SELECT count(*) FROM :"etl_schema".modality_note_link
-        WHERE source_table = 'cxr' AND person_id IS NOT NULL AND note_id IS NULL)),
-    ('eligible_ecg_unloaded', (SELECT count(*) FROM :"etl_schema".modality_note_link
-        WHERE source_table = 'ecg_machine' AND person_id IS NOT NULL AND load_status <> 'EMPTY_TEXT' AND note_id IS NULL)),
-    ('fabricated_echo_note', (SELECT count(*) FROM :"etl_schema".modality_note_link
-        WHERE source_table = 'echo' AND note_id IS NOT NULL)),
-    ('variant_flag_missing', (
-        SELECT count(*) FROM :"cdm_schema".note n WHERE n.note_source_value = 'CXR_VARIANT'
-          AND NOT EXISTS (SELECT 1 FROM :"etl_schema".note_detail d WHERE d.note_id = n.note_id
-              AND d.field_name = 'duplicate_status' AND d.field_value = 'UNRESOLVED_POSSIBLE_DUPLICATE')
-    ))
+VALUES ('duplicate_note_id', (SELECT count(*) - count(DISTINCT note_id) FROM :"cdm_schema".note))
 )
-
 SELECT jsonb_build_object(
     'status', CASE WHEN (SELECT bool_and(violations = 0) FROM note_convention_checks) THEN 'PASS' ELSE 'FAIL' END,
     'checks', (SELECT jsonb_object_agg(check_name, violations) FROM note_convention_checks),
     'note_counts', (SELECT jsonb_object_agg(note_source_value, rows)
         FROM (SELECT note_source_value, count(*) AS rows FROM :"cdm_schema".note GROUP BY 1) s),
-    'source_accounting', (SELECT jsonb_agg(s) FROM (
-        SELECT source_table, load_status, visit_status, count(*) AS rows
-        FROM :"etl_schema".note_metadata GROUP BY 1,2,3 ORDER BY 1,2,3
-    ) s)
+    'legacy_cxr_date_proxy_rows', (SELECT count(*) FROM :"cdm_schema".note
+        WHERE note_source_value IN ('CXR','CXR_SUPPLEMENT','CXR_VARIANT'))
 )::text AS note_convention_report,
     (SELECT bool_and(violations = 0) FROM note_convention_checks) AS note_convention_pass
 \gset
@@ -110,6 +82,5 @@ SELECT jsonb_build_object(
 COMMIT;
 \else
 ROLLBACK;
-\echo NOTE convention violations are listed in NOTE_CONVENTION_REPORT.
 SELECT 1 / 0 AS note_convention_check_failed;
 \endif

@@ -1,494 +1,277 @@
 -- -------------------------------------------------------------------
 -- MIMIC IV CDM Conversion
--- Populate NOTE in an existing PostgreSQL CDM
---
--- Same rules as st_note.sql, lk_note.sql, cdm_note.sql and ext_note.sql.
--- Execute with psql -X -v ON_ERROR_STOP=1; see docs/note_etl.md.
+-- NOTE-only ETL: source -> lookup -> INSERT / visit UPDATE -> validation
+-- No persistent staging, CDM extensions, type migrations or other CDM DML.
+-- Run with psql -X; audit_file receives metadata, never note text.
 -- -------------------------------------------------------------------
-
--- -------------------------------------------------------------------
--- Connection-independent parameters
--- -------------------------------------------------------------------
-
 \set ON_ERROR_STOP on
 \if :{?source_schema}
 \else
 \set source_schema mimiciv_note
 \endif
+\if :{?radiology_schema}
+\else
+\set radiology_schema mimiciv_note
+\endif
 \if :{?cdm_schema}
 \else
 \set cdm_schema mimiciv
-\endif
-\if :{?etl_schema}
-\else
-\set etl_schema mimiciv_note_etl
 \endif
 \if :{?source_table}
 \else
 \set source_table discharge
 \endif
-\if :{?source_version}
-\else
-\set source_version 2.2
-\endif
-\if :{?source_sha256}
-\else
-\set source_sha256 ''
-\endif
-
--- -------------------------------------------------------------------
--- Start a source-specific transaction
--- -------------------------------------------------------------------
-
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SET LOCAL client_encoding = 'UTF8';
+SET LOCAL TimeZone = 'UTC';
 SET LOCAL lock_timeout = '30s';
 SELECT pg_advisory_xact_lock(hashtext(current_database()), hashtext(:'cdm_schema' || '.note')) \gset
 CREATE TEMP TABLE note_checks (
-    check_name text PRIMARY KEY,
-    passed boolean NOT NULL CHECK (passed)
+    check_name text PRIMARY KEY, passed boolean NOT NULL CHECK (passed)
 ) ON COMMIT DROP;
 INSERT INTO note_checks VALUES
-    ('supported_source', :'source_table' IN ('discharge', 'radiology', 'cxr', 'ecg_machine'));
-SELECT :'source_table' || '_detail' AS detail_table \gset
+    ('supported_source', :'source_table' IN ('discharge','radiology','cxr','ecg_machine')),
+    ('existing_bigint_identifiers', (
+        SELECT count(*) = 4 FROM information_schema.columns
+        WHERE table_schema = :'cdm_schema' AND table_name = 'note'
+          AND column_name IN ('note_id','person_id','visit_occurrence_id','visit_detail_id')
+          AND data_type = 'bigint'));
+CREATE FUNCTION pg_temp.note_key(dataset text, source_table text, source_note_id text)
+RETURNS bigint LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT ('x' || substr(encode(sha256(convert_to(
+        dataset || '|' || source_table || '|' || source_note_id, 'UTF8')), 'hex'), 1, 15))::bit(60)::bigint
+$$;
 
 -- -------------------------------------------------------------------
--- lk_note_type
--- Rules 1-2: discharge summaries and radiology reports
+-- src_note_text: adapters expose the same read-only source contract
 -- -------------------------------------------------------------------
-
-CREATE TEMP TABLE lk_note_type (
-    source_table text, note_type text, loinc_code text, note_title text
-) ON COMMIT DROP;
-INSERT INTO lk_note_type VALUES
-    ('discharge', 'DS', '18842-5', 'Discharge summary'),
-    ('discharge', 'AD', '18842-5', 'Discharge summary addendum'),
-    ('radiology', 'RR', '68604-8', 'Radiology report'),
-    ('radiology', 'AR', '68604-8', 'Radiology report addendum'),
-    ('cxr', 'CXR', '68604-8', 'Chest radiograph report'),
-    ('cxr', 'CXR_VARIANT', '68604-8', 'Chest radiograph source report (possible duplicate or variant)'),
-    ('cxr', 'CXR_SUPPLEMENT', '68604-8', 'Chest radiograph supplementary report (preliminary/addendum)'),
-    ('ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation');
-
--- -------------------------------------------------------------------
--- src_note
--- -------------------------------------------------------------------
-
--- The positive 60-bit SHA-256 prefix is identical to the BigQuery expression.
--- Source version is provenance, not part of a document's stable identity.
+SELECT :'source_table' = 'cxr' AS is_cxr, :'source_table' = 'ecg_machine' AS is_ecg \gset
+\if :is_cxr
+\ir st_cxr_note.sql
+\elif :is_ecg
+\ir st_ecg_note.sql
+\else
+CREATE TEMP VIEW src_note_text AS
+SELECT note_id::text AS source_note_id, subject_id, hadm_id, note_type,
+    charttime, storetime, text AS note_text,
+    NULL::text AS study_id, NULL::bigint AS reuse_note_id,
+    'DOCUMENT_CHARTTIME'::text AS timestamp_basis, 'REPORT'::text AS component_kind,
+    NULL::text AS match_method
+FROM :"source_schema".:"source_table";
+\endif
 CREATE TEMP TABLE src_note ON COMMIT DROP AS
 SELECT
-    :'source_table'::text AS source_table,
-    note_id::text AS source_note_id,
-    ('x' || substr(encode(sha256(convert_to(
-        CASE :'source_table'
-            WHEN 'cxr' THEN 'mimic-cxr'
-            WHEN 'ecg_machine' THEN 'mimic-iv-ecg'
-            ELSE 'mimic-iv-note'
-        END || '|' || :'source_table' || '|' || note_id, 'UTF8'
-    )), 'hex'), 1, 15))::bit(60)::bigint AS note_id,
-    subject_id                              AS subject_id,
-    hadm_id                                 AS hadm_id,
-    note_type                               AS note_type,
-    note_seq                                AS note_seq,
-    charttime                               AS charttime,
-    storetime                               AS storetime,
-    encode(sha256(convert_to(text, 'UTF8')), 'hex') AS text_sha256,
-    octet_length(convert_to(text, 'UTF8'))::bigint AS text_bytes
-FROM
-    :"source_schema".:"source_table"
-;
+    :'source_table'::text                        AS source_table,
+    s.source_note_id                            AS source_note_id,
+    pg_temp.note_key(CASE :'source_table'
+        WHEN 'cxr' THEN 'mimic-cxr' WHEN 'ecg_machine' THEN 'mimic-iv-ecg'
+        ELSE 'mimic-iv-note' END, :'source_table', s.source_note_id) AS note_id,
+    s.subject_id, s.hadm_id, s.note_type, s.charttime, s.storetime,
+    s.study_id, s.reuse_note_id, s.timestamp_basis, s.component_kind, s.match_method,
+    encode(sha256(convert_to(s.note_text,'UTF8')),'hex') AS text_sha256,
+    octet_length(s.note_text)::bigint            AS text_bytes,
+    btrim(s.note_text, E' \t\r\n') <> ''         AS has_text
+FROM src_note_text s;
 CREATE UNIQUE INDEX ON src_note(source_note_id);
 CREATE UNIQUE INDEX ON src_note(note_id);
 ANALYZE src_note;
-
-INSERT INTO note_checks VALUES
-    -- A completely reconciled CXR source can legitimately add zero documents.
-    ('nonempty_source', :'source_table' = 'cxr' OR (SELECT count(*) > 0 FROM src_note)),
-    ('source_required_fields', NOT EXISTS (
-        SELECT 1 FROM src_note WHERE source_note_id IS NULL OR source_note_id = ''
-        OR subject_id IS NULL OR charttime IS NULL OR text_sha256 IS NULL OR text_bytes = 0
-    )),
-    ('supported_note_types', NOT EXISTS (
-        SELECT 1 FROM src_note s LEFT JOIN lk_note_type m
-        USING (source_table, note_type) WHERE m.note_type IS NULL
-    )),
-    ('constant_concepts', (
-        SELECT count(*) = 3 FROM :"cdm_schema".concept
-        WHERE ((concept_id = 32817 AND domain_id = 'Type Concept')
-            OR (concept_id = 32678 AND domain_id = 'Metadata')
-            OR (concept_id = 4180186 AND domain_id = 'Language'))
-          AND standard_concept = 'S' AND invalid_reason IS NULL
-          AND CURRENT_DATE BETWEEN valid_start_date AND valid_end_date
-    ));
+INSERT INTO note_checks VALUES ('source_identity', (
+        SELECT count(*) = 0 FROM src_note WHERE source_note_id IS NULL OR source_note_id = '' OR subject_id IS NULL));
 
 -- -------------------------------------------------------------------
--- lk_note_mapped
--- Keep existing Core person and visit identifiers
+-- lk_note_type / lk_note_person / lk_note_visit
+-- Admission keys are numeric. subject|date pseudo-visits are excluded.
+-- An explicit but unmatched hadm_id never falls back to another visit.
 -- -------------------------------------------------------------------
-
+CREATE TEMP TABLE lk_note_type (
+    source_table text, note_type text PRIMARY KEY, loinc_code text, note_title text
+) ON COMMIT DROP;
+INSERT INTO lk_note_type VALUES
+    ('discharge','DS','18842-5','Discharge summary'),
+    ('discharge','AD','18842-5','Discharge summary addendum'),
+    ('radiology','RR','68604-8','Radiology report'),
+    ('radiology','AR','68604-8','Radiology report addendum'),
+    ('cxr','CXR','68604-8','Chest radiograph report'),
+    ('cxr','CXR_SUPPLEMENT','68604-8','Chest radiograph supplementary report (preliminary/addendum)'),
+    ('cxr','CXR_VARIANT','68604-8','Chest radiograph source report (possible duplicate or variant)'),
+    ('ecg_machine','ECG_MACHINE','75425-9','ECG machine interpretation');
+CREATE TEMP TABLE lk_note_person ON COMMIT DROP AS
+SELECT s.*, p.person_id, old.note_id IS NOT NULL AS already_loaded,
+    old.note_date AS existing_note_date, old.visit_occurrence_id AS existing_visit_id,
+    old.visit_detail_id AS existing_visit_detail_id,
+    reused.note_date AS reused_note_date, reused.note_datetime AS reused_note_datetime,
+    reused.visit_occurrence_id AS reused_visit_id
+FROM src_note s
+LEFT JOIN :"cdm_schema".person p ON p.person_source_value = s.subject_id::text
+LEFT JOIN :"cdm_schema".note old ON old.note_id = s.note_id
+LEFT JOIN :"cdm_schema".note reused ON reused.note_id = s.reuse_note_id;
+CREATE UNIQUE INDEX ON lk_note_person(source_note_id);
+ANALYZE lk_note_person;
+CREATE TEMP TABLE lk_note_visit ON COMMIT DROP AS
+SELECT v.* FROM :"cdm_schema".visit_occurrence v
+WHERE split_part(v.visit_source_value,'|',2) ~ '^[0-9]+$';
+CREATE UNIQUE INDEX ON lk_note_visit(visit_occurrence_id);
+CREATE INDEX ON lk_note_visit(person_id, visit_source_value);
+CREATE INDEX ON lk_note_visit(person_id, visit_start_datetime, visit_end_datetime);
+ANALYZE lk_note_visit;
+CREATE TEMP TABLE lk_note_visit_match ON COMMIT DROP AS
+SELECT s.note_id, count(v.visit_occurrence_id) AS candidate_count,
+    CASE WHEN count(v.visit_occurrence_id) = 1 THEN min(v.visit_occurrence_id) END AS visit_occurrence_id
+FROM lk_note_person s
+LEFT JOIN lk_note_visit v ON v.person_id = s.person_id AND (
+    (s.hadm_id IS NOT NULL AND v.visit_source_value = s.subject_id::text || '|' || s.hadm_id::text)
+    OR (s.hadm_id IS NULL AND s.timestamp_basis = 'DOCUMENT_CHARTTIME'
+        AND s.charttime BETWEEN v.visit_start_datetime AND v.visit_end_datetime))
+GROUP BY s.note_id;
+CREATE UNIQUE INDEX ON lk_note_visit_match(note_id);
 CREATE TEMP TABLE lk_note_mapped ON COMMIT DROP AS
 SELECT
-    src.*,
-    per.person_id                               AS person_id,
-    vis.visit_occurrence_id                     AS visit_occurrence_id,
-    vc.concept_id                               AS note_class_concept_id,
-    map.note_title                              AS note_title,
+    s.*,
+    c.concept_id                                AS note_class_concept_id,
+    m.note_title                               AS note_title,
+    CASE WHEN s.source_table = 'cxr' THEN coalesce(s.existing_visit_id,s.reused_visit_id)
+         WHEN s.hadm_id IS NOT NULL THEN v.visit_occurrence_id
+         WHEN s.existing_visit_id IS NOT NULL THEN s.existing_visit_id
+         ELSE v.visit_occurrence_id END         AS visit_occurrence_id,
+    v.candidate_count                          AS visit_candidate_count,
     CASE
-        WHEN per.person_id IS NULL THEN 'MISSING_PERSON'
+        WHEN s.person_id IS NULL THEN 'MISSING_PERSON'
+        WHEN s.has_text IS NOT TRUE THEN 'EMPTY_TEXT'
+        WHEN s.already_loaded AND s.source_table = 'cxr' THEN 'LEGACY_DATE_PROXY_RETAINED'
+        WHEN s.reuse_note_id IS NOT NULL THEN 'REUSED_EXISTING_RADIOLOGY'
+        WHEN s.charttime IS NULL THEN 'MISSING_DOCUMENT_DATE'
         ELSE 'LOADED'
     END                                         AS load_status,
     CASE
-        WHEN per.person_id IS NULL THEN 'MISSING_PERSON'
-        WHEN src.hadm_id IS NULL THEN 'NO_HADM_ID'
-        WHEN vis.visit_occurrence_id IS NULL THEN 'MISSING_VISIT'
-        ELSE 'MATCHED'
+        WHEN s.source_table = 'cxr' AND s.reuse_note_id IS NOT NULL THEN 'REUSED_RADIOLOGY_VISIT'
+        WHEN s.source_table = 'cxr' THEN 'NO_DOCUMENT_TIME'
+        WHEN s.hadm_id IS NOT NULL AND v.candidate_count = 1 THEN 'EXPLICIT_HADM'
+        WHEN s.hadm_id IS NOT NULL THEN 'UNMATCHED_EXPLICIT_HADM'
+        WHEN s.existing_visit_id IS NOT NULL THEN 'PRESERVED_EXISTING_VISIT'
+        WHEN s.timestamp_basis = 'DEVICE_CLOCK_UNSYNCHRONIZED' THEN 'UNSYNCHRONIZED_DEVICE_CLOCK'
+        WHEN v.candidate_count = 1 THEN 'UNIQUE_ADMISSION_INTERVAL'
+        WHEN v.candidate_count > 1 THEN 'AMBIGUOUS_ADMISSION_INTERVAL'
+        ELSE 'NO_ADMISSION_INTERVAL'
     END                                         AS visit_status
-FROM
-    src_note src
-INNER JOIN
-    lk_note_type map
-        ON  map.source_table = src.source_table
-        AND map.note_type = src.note_type
-LEFT JOIN
-    :"cdm_schema".person per
-        ON per.person_source_value = CAST(src.subject_id AS text)
-LEFT JOIN
-    :"cdm_schema".visit_occurrence vis
-        ON  vis.person_id = per.person_id
-        AND src.hadm_id IS NOT NULL
-        AND vis.visit_source_value =
-            CAST(src.subject_id AS text) || '|' || CAST(src.hadm_id AS text)
-LEFT JOIN
-    :"cdm_schema".concept vc
-        ON  vc.vocabulary_id = 'LOINC'
-        AND vc.concept_code = map.loinc_code
-        AND vc.domain_id = 'Note'
-        AND vc.standard_concept = 'S'
-        AND vc.invalid_reason IS NULL
-        AND CURRENT_DATE BETWEEN vc.valid_start_date AND vc.valid_end_date
-;
-
-INSERT INTO note_checks VALUES
-    ('no_join_fanout', (SELECT count(*) FROM lk_note_mapped) = (SELECT count(*) FROM src_note)),
-    ('document_class_mapping', NOT EXISTS (
-        SELECT 1 FROM lk_note_mapped WHERE note_class_concept_id IS NULL
-    )),
-    ('detail_parent_and_subject', NOT EXISTS (
-        SELECT 1 FROM :"source_schema".:"detail_table" d
-        INNER JOIN src_note s ON s.source_note_id = d.note_id
-        WHERE s.subject_id IS DISTINCT FROM d.subject_id
-    ));
-CREATE UNIQUE INDEX ON lk_note_mapped(source_note_id);
+FROM lk_note_person s
+LEFT JOIN lk_note_type m ON m.source_table = s.source_table AND m.note_type = s.note_type
+LEFT JOIN :"cdm_schema".concept c ON c.vocabulary_id = 'LOINC'
+    AND c.concept_code = m.loinc_code AND c.domain_id = 'Note'
+    AND c.standard_concept = 'S' AND c.invalid_reason IS NULL
+    AND CURRENT_DATE BETWEEN c.valid_start_date AND c.valid_end_date
+INNER JOIN lk_note_visit_match v USING (note_id);
 CREATE UNIQUE INDEX ON lk_note_mapped(note_id);
 ANALYZE lk_note_mapped;
 
--- -------------------------------------------------------------------
--- Persistent NOTE provenance tables
--- -------------------------------------------------------------------
-
-CREATE SCHEMA IF NOT EXISTS :"etl_schema";
-CREATE TABLE IF NOT EXISTS :"etl_schema".note_id_map (
-    source_table text NOT NULL,
-    source_note_id text NOT NULL,
-    note_id bigint NOT NULL UNIQUE,
-    PRIMARY KEY (source_table, source_note_id)
-);
-CREATE TABLE IF NOT EXISTS :"etl_schema".note_metadata (
-    source_table text NOT NULL,
-    source_note_id text NOT NULL,
-    note_id bigint NOT NULL,
-    source_version text NOT NULL,
-    source_sha256 text,
-    subject_id integer NOT NULL,
-    hadm_id integer,
-    note_type text NOT NULL,
-    note_seq integer NOT NULL,
-    charttime timestamp NOT NULL,
-    storetime timestamp,
-    person_id bigint,
-    visit_occurrence_id bigint,
-    text_sha256 text NOT NULL,
-    text_bytes bigint NOT NULL,
-    load_status text NOT NULL,
-    visit_status text NOT NULL,
-    updated_at timestamptz NOT NULL,
-    PRIMARY KEY (source_table, source_note_id)
-);
-CREATE TABLE IF NOT EXISTS :"etl_schema".note_detail (
-    source_table text NOT NULL,
-    source_note_id text NOT NULL,
-    note_id bigint,
-    subject_id integer NOT NULL,
-    field_name text NOT NULL,
-    field_value text NOT NULL,
-    field_ordinal integer NOT NULL
-);
-ALTER TABLE :"etl_schema".note_detail ALTER COLUMN note_id DROP NOT NULL;
-CREATE INDEX IF NOT EXISTS note_detail_note_id_idx ON :"etl_schema".note_detail(note_id);
-CREATE TABLE IF NOT EXISTS :"etl_schema".note_etl_run (
-    run_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    finished_at timestamptz NOT NULL,
-    source_table text NOT NULL,
-    source_version text NOT NULL,
-    source_sha256 text,
-    source_rows bigint NOT NULL,
-    loaded_rows bigint NOT NULL,
-    rejected_person_rows bigint NOT NULL,
-    missing_visit_rows bigint NOT NULL,
-    no_hadm_rows bigint NOT NULL,
-    detail_rows bigint NOT NULL,
-    changed_note_rows bigint NOT NULL,
-    text_mismatches bigint NOT NULL,
-    passed_checks bigint NOT NULL,
-    unmatched_detail_rows bigint NOT NULL DEFAULT 0
-);
-ALTER TABLE :"etl_schema".note_etl_run
-    ADD COLUMN IF NOT EXISTS unmatched_detail_rows bigint NOT NULL DEFAULT 0;
-
--- -------------------------------------------------------------------
--- Check ownership of existing note identifiers
--- -------------------------------------------------------------------
-
+-- Existing identity and text are immutable. Changed sources need review.
+-- Count the complete population: EXISTS startup plans can repeatedly probe
+-- millions of rows when the expected number of violations is zero.
 INSERT INTO note_checks VALUES
-    ('stable_id_map', NOT EXISTS (
-        SELECT 1 FROM lk_note_mapped w JOIN :"etl_schema".note_id_map m
-          ON (m.source_table = w.source_table AND m.source_note_id = w.source_note_id)
-          OR m.note_id = w.note_id
-        WHERE (m.source_table, m.source_note_id, m.note_id)
-           IS DISTINCT FROM (w.source_table, w.source_note_id, w.note_id)
-    )),
-    ('no_unowned_target_id_collision', NOT EXISTS (
-        SELECT 1 FROM lk_note_mapped w JOIN :"cdm_schema".note n ON n.note_id = w.note_id
-        LEFT JOIN :"etl_schema".note_id_map m ON m.note_id = n.note_id
-        WHERE m.note_id IS NULL
-    )),
-    ('no_implicit_source_deletions', NOT EXISTS (
-        SELECT 1 FROM :"etl_schema".note_id_map m JOIN :"cdm_schema".note n USING (note_id)
-        LEFT JOIN lk_note_mapped w ON w.note_id = m.note_id AND w.person_id IS NOT NULL
-        WHERE m.source_table = :'source_table' AND w.note_id IS NULL
-    ));
+    ('no_unaccounted_existing_source', (
+        SELECT count(*) = 0 FROM :"cdm_schema".note n
+        WHERE n.note_source_value IN (SELECT note_type FROM lk_note_type WHERE source_table = :'source_table')
+          AND NOT EXISTS (SELECT 1 FROM src_note s WHERE s.note_id = n.note_id))),
+    ('document_class_mapping', (
+        SELECT count(*) = 0 FROM lk_note_mapped WHERE note_class_concept_id IS NULL)),
+    ('constant_concepts', (SELECT count(*) = 3 FROM :"cdm_schema".concept
+        WHERE ((concept_id = 32817 AND domain_id = 'Type Concept')
+            OR (concept_id = 32678 AND domain_id = 'Metadata')
+            OR (concept_id = 4180186 AND domain_id = 'Language'))
+        AND standard_concept = 'S' AND invalid_reason IS NULL
+        AND CURRENT_DATE BETWEEN valid_start_date AND valid_end_date)),
+    ('unambiguous_explicit_hadm', (
+        SELECT count(*) = 0 FROM lk_note_mapped WHERE hadm_id IS NOT NULL AND visit_candidate_count > 1)),
+    ('existing_identity_and_text', (
+        SELECT count(*) = 0 FROM lk_note_mapped s INNER JOIN :"cdm_schema".note n USING (note_id)
+        WHERE n.person_id IS DISTINCT FROM s.person_id OR n.note_source_value IS DISTINCT FROM s.note_type
+          OR encode(sha256(convert_to(n.note_text,'UTF8')),'hex') IS DISTINCT FROM s.text_sha256
+          OR (s.source_table <> 'cxr' AND (n.note_date IS DISTINCT FROM s.charttime::date
+              OR n.note_datetime IS DISTINCT FROM s.charttime))
+          OR s.has_text IS NOT TRUE)),
+    ('existing_visit_consistent', (
+        SELECT count(*) = 0 FROM lk_note_mapped s
+        LEFT JOIN :"cdm_schema".visit_occurrence v ON v.visit_occurrence_id = s.existing_visit_id
+        WHERE s.existing_visit_id IS NOT NULL AND (v.person_id IS DISTINCT FROM s.person_id
+          OR (s.hadm_id IS NOT NULL AND s.existing_visit_id IS DISTINCT FROM s.visit_occurrence_id)))),
+    ('reused_report_same_person', (
+        SELECT count(*) = 0 FROM lk_note_mapped s LEFT JOIN :"cdm_schema".note n ON n.note_id = s.reuse_note_id
+        WHERE s.reuse_note_id IS NOT NULL AND n.person_id IS DISTINCT FROM s.person_id));
 
 -- -------------------------------------------------------------------
--- Match existing Core ID types
+-- note: only these two statements modify permanent clinical data
 -- -------------------------------------------------------------------
-
--- Core IDs are preserved verbatim; concept IDs remain ordinary integers.
--- Skip columns already widened by an earlier load: PostgreSQL rejects even
--- an unchanged TYPE when a view depends on the column.
-SELECT format(
-    'ALTER TABLE %I.%I ALTER COLUMN %I TYPE bigint',
-    :'cdm_schema', ids.table_name, ids.column_name
-)
-FROM (VALUES
-    ('note', 'note_id'),
-    ('note', 'person_id'),
-    ('note', 'visit_occurrence_id'),
-    ('note', 'visit_detail_id'),
-    ('note_nlp', 'note_id')
-) AS ids(table_name, column_name)
-INNER JOIN pg_attribute attr
-    ON  attr.attrelid = format('%I.%I', :'cdm_schema', ids.table_name)::regclass
-    AND attr.attname = ids.column_name
-    AND NOT attr.attisdropped
-WHERE attr.atttypid <> 'bigint'::regtype
-ORDER BY ids.table_name, ids.column_name
-\gexec
-
--- -------------------------------------------------------------------
--- cdm_note
--- Rules 1-2: discharge summaries and radiology reports
--- -------------------------------------------------------------------
-
--- PostgreSQL upserts in place to retain constraints and avoid rewriting
--- unchanged text. note_changed records only inserted or modified rows.
-CREATE TEMP TABLE note_changed ON COMMIT DROP AS
-WITH changed AS (
-    INSERT INTO :"cdm_schema".note AS n (
+CREATE TEMP TABLE note_changes (note_id bigint PRIMARY KEY, action text) ON COMMIT DROP;
+WITH inserted AS (
+    INSERT INTO :"cdm_schema".note (
         note_id, person_id, note_date, note_datetime, note_type_concept_id,
         note_class_concept_id, note_title, note_text, encoding_concept_id,
         language_concept_id, provider_id, visit_occurrence_id, visit_detail_id, note_source_value
     )
     SELECT
-        src.note_id                             AS note_id,
-        src.person_id                           AS person_id,
-        CAST(src.charttime AS date)             AS note_date,
-        -- CXR supplies acquisition time, not document recording time.
-        CASE WHEN src.source_table = 'cxr' THEN CAST(NULL AS timestamp)
-             ELSE src.charttime END             AS note_datetime,
-        32817                                   AS note_type_concept_id, -- EHR
-        src.note_class_concept_id                AS note_class_concept_id,
-        src.note_title                          AS note_title,
-        raw.text                                AS note_text,
-        32678                                   AS encoding_concept_id, -- UTF-8
-        4180186                                 AS language_concept_id, -- English
-        CAST(NULL AS integer)                  AS provider_id,
-        src.visit_occurrence_id                 AS visit_occurrence_id,
-        CAST(NULL AS bigint)                   AS visit_detail_id,
-        src.note_type                           AS note_source_value
-    FROM
-        lk_note_mapped src
-    INNER JOIN
-        :"source_schema".:"source_table" raw
-            ON raw.note_id = src.source_note_id
-    WHERE
-        src.person_id IS NOT NULL
-    ON CONFLICT (note_id) DO UPDATE SET
-        person_id = EXCLUDED.person_id, note_date = EXCLUDED.note_date,
-        note_datetime = EXCLUDED.note_datetime, note_type_concept_id = EXCLUDED.note_type_concept_id,
-        note_class_concept_id = EXCLUDED.note_class_concept_id, note_title = EXCLUDED.note_title,
-        note_text = EXCLUDED.note_text, encoding_concept_id = EXCLUDED.encoding_concept_id,
-        language_concept_id = EXCLUDED.language_concept_id, provider_id = EXCLUDED.provider_id,
-        visit_occurrence_id = EXCLUDED.visit_occurrence_id, visit_detail_id = EXCLUDED.visit_detail_id,
-        note_source_value = EXCLUDED.note_source_value
-    WHERE (n.person_id, n.note_date, n.note_datetime, n.note_type_concept_id,
-           n.note_class_concept_id, n.note_title, n.note_text, n.encoding_concept_id,
-           n.language_concept_id, n.provider_id, n.visit_occurrence_id,
-           n.visit_detail_id, n.note_source_value)
-       IS DISTINCT FROM
-          (EXCLUDED.person_id, EXCLUDED.note_date, EXCLUDED.note_datetime, EXCLUDED.note_type_concept_id,
-           EXCLUDED.note_class_concept_id, EXCLUDED.note_title, EXCLUDED.note_text,
-           EXCLUDED.encoding_concept_id, EXCLUDED.language_concept_id, EXCLUDED.provider_id,
-           EXCLUDED.visit_occurrence_id, EXCLUDED.visit_detail_id, EXCLUDED.note_source_value)
+        s.note_id                               AS note_id,
+        s.person_id                             AS person_id,
+        s.charttime::date                       AS note_date,
+        s.charttime                             AS note_datetime,
+        32817                                   AS note_type_concept_id,
+        s.note_class_concept_id                 AS note_class_concept_id,
+        s.note_title                            AS note_title,
+        raw.note_text                           AS note_text,
+        32678                                   AS encoding_concept_id,
+        4180186                                 AS language_concept_id,
+        NULL::bigint                            AS provider_id,
+        s.visit_occurrence_id                   AS visit_occurrence_id,
+        NULL::bigint                            AS visit_detail_id,
+        s.note_type                             AS note_source_value
+    FROM lk_note_mapped s
+    INNER JOIN src_note_text raw USING (source_note_id)
+    WHERE s.load_status = 'LOADED' AND NOT s.already_loaded
     RETURNING note_id
 )
-SELECT note_id FROM changed;
-
--- -------------------------------------------------------------------
--- NOTE source identifiers and metadata
--- -------------------------------------------------------------------
-
-INSERT INTO :"etl_schema".note_id_map
-SELECT
-    src.source_table                            AS source_table,
-    src.source_note_id                          AS source_note_id,
-    src.note_id                                 AS note_id
-FROM
-    lk_note_mapped src
-ON CONFLICT (source_table, source_note_id) DO NOTHING
-;
-
-DELETE FROM :"etl_schema".note_metadata WHERE source_table = :'source_table';
-INSERT INTO :"etl_schema".note_metadata
-SELECT
-    src.source_table                            AS source_table,
-    src.source_note_id                          AS source_note_id,
-    src.note_id                                 AS note_id,
-    :'source_version'                           AS source_version,
-    NULLIF(:'source_sha256', '')                AS source_sha256,
-    src.subject_id                              AS subject_id,
-    src.hadm_id                                 AS hadm_id,
-    src.note_type                               AS note_type,
-    src.note_seq                                AS note_seq,
-    src.charttime                               AS charttime,
-    src.storetime                               AS storetime,
-    src.person_id                               AS person_id,
-    src.visit_occurrence_id                     AS visit_occurrence_id,
-    src.text_sha256                             AS text_sha256,
-    src.text_bytes                              AS text_bytes,
-    src.load_status                             AS load_status,
-    src.visit_status                            AS visit_status,
-    CURRENT_TIMESTAMP                          AS updated_at
-FROM
-    lk_note_mapped src
-;
-
--- -------------------------------------------------------------------
--- NOTE detail
--- Keep field ordinal and duplicate multiplicity
--- -------------------------------------------------------------------
-
-DELETE FROM :"etl_schema".note_detail WHERE source_table = :'source_table';
-
-INSERT INTO :"etl_schema".note_detail
-SELECT
-    :'source_table'::text                        AS source_table,
-    det.note_id                                 AS source_note_id,
-    src.note_id                                 AS note_id,
-    det.subject_id                              AS subject_id,
-    det.field_name                              AS field_name,
-    det.field_value                             AS field_value,
-    det.field_ordinal                           AS field_ordinal
-FROM
-    :"source_schema".:"detail_table" det
-LEFT JOIN
-    lk_note_mapped src
-        ON src.source_note_id = det.note_id
-;
-
--- -------------------------------------------------------------------
--- Validate every mapped NOTE field and all detail rows
--- -------------------------------------------------------------------
-
-CREATE TEMP TABLE note_differences ON COMMIT DROP AS
-SELECT w.source_note_id
-FROM lk_note_mapped w LEFT JOIN :"cdm_schema".note n ON n.note_id = w.note_id
-WHERE w.person_id IS NOT NULL AND (
-    n.note_id IS NULL
-    OR (n.person_id, n.note_date, n.note_datetime, n.note_type_concept_id,
-        n.note_class_concept_id, n.note_title, n.encoding_concept_id,
-        n.language_concept_id, n.provider_id, n.visit_occurrence_id,
-        n.visit_detail_id, n.note_source_value,
-        encode(sha256(convert_to(n.note_text, 'UTF8')), 'hex'),
-        octet_length(convert_to(n.note_text, 'UTF8'))::bigint)
-    IS DISTINCT FROM
-       (w.person_id, w.charttime::date,
-        CASE WHEN w.source_table = 'cxr' THEN CAST(NULL AS timestamp) ELSE w.charttime END, 32817,
-        w.note_class_concept_id, w.note_title, 32678, 4180186, NULL::integer,
-        w.visit_occurrence_id, NULL::bigint, w.note_type, w.text_sha256, w.text_bytes)
-);
-INSERT INTO note_checks VALUES
-    ('every_loaded_field_matches', NOT EXISTS (SELECT 1 FROM note_differences)),
-    ('source_accounting', (SELECT count(*) FROM src_note) = (
-        SELECT count(*) FROM lk_note_mapped WHERE load_status IN ('LOADED', 'MISSING_PERSON')
-    )),
-    ('owned_target_row_count', (
-        SELECT count(*) FROM :"cdm_schema".note n
-        JOIN :"etl_schema".note_id_map m USING (note_id) WHERE m.source_table = :'source_table'
-    ) = (SELECT count(*) FROM lk_note_mapped WHERE person_id IS NOT NULL)),
-    ('detail_note_links_match', NOT EXISTS (
-        SELECT 1 FROM :"etl_schema".note_detail d
-        LEFT JOIN lk_note_mapped s ON s.source_note_id = d.source_note_id
-        WHERE d.source_table = :'source_table'
-          AND d.note_id IS DISTINCT FROM s.note_id
-    )),
-    ('all_detail_rows_preserved', NOT EXISTS (
-        (SELECT note_id, subject_id, field_name, field_value, field_ordinal
-         FROM :"source_schema".:"detail_table"
-         EXCEPT ALL
-         SELECT source_note_id, subject_id, field_name, field_value, field_ordinal
-         FROM :"etl_schema".note_detail WHERE source_table = :'source_table')
-        UNION ALL
-        (SELECT source_note_id, subject_id, field_name, field_value, field_ordinal
-         FROM :"etl_schema".note_detail WHERE source_table = :'source_table'
-         EXCEPT ALL
-         SELECT note_id, subject_id, field_name, field_value, field_ordinal
-         FROM :"source_schema".:"detail_table")
-    ));
-
--- -------------------------------------------------------------------
--- Record a successful run and commit
--- -------------------------------------------------------------------
-
-INSERT INTO :"etl_schema".note_etl_run (
-    finished_at, source_table, source_version, source_sha256, source_rows, loaded_rows,
-    rejected_person_rows, missing_visit_rows, no_hadm_rows, detail_rows, changed_note_rows,
-    text_mismatches, passed_checks, unmatched_detail_rows
+INSERT INTO note_changes SELECT note_id, 'INSERT' FROM inserted;
+WITH updated AS (
+    UPDATE :"cdm_schema".note n SET visit_occurrence_id = s.visit_occurrence_id
+    FROM lk_note_mapped s
+    WHERE n.note_id = s.note_id AND s.load_status = 'LOADED'
+      AND n.visit_occurrence_id IS NULL AND s.visit_occurrence_id IS NOT NULL
+    RETURNING n.note_id
 )
-SELECT clock_timestamp(), :'source_table', :'source_version', NULLIF(:'source_sha256', ''),
-    count(*), count(*) FILTER (WHERE load_status = 'LOADED'),
-    count(*) FILTER (WHERE load_status = 'MISSING_PERSON'),
-    count(*) FILTER (WHERE visit_status = 'MISSING_VISIT'),
-    count(*) FILTER (WHERE visit_status = 'NO_HADM_ID'),
-    (SELECT count(*) FROM :"source_schema".:"detail_table"),
-    (SELECT count(*) FROM note_changed), (SELECT count(*) FROM note_differences),
-    (SELECT count(*) FROM note_checks),
-    (SELECT count(*) FROM :"etl_schema".note_detail
-     WHERE source_table = :'source_table' AND note_id IS NULL)
-FROM lk_note_mapped
-RETURNING run_id \gset
-ANALYZE :"cdm_schema".note;
+INSERT INTO note_changes SELECT note_id, 'VISIT_UPDATE' FROM updated;
+INSERT INTO note_checks VALUES
+    ('loaded_rows_match_source', (
+        SELECT count(*) = 0 FROM lk_note_mapped s LEFT JOIN :"cdm_schema".note n USING (note_id)
+        WHERE s.load_status IN ('LOADED','LEGACY_DATE_PROXY_RETAINED') AND (
+            n.note_id IS NULL OR n.person_id IS DISTINCT FROM s.person_id
+            OR n.note_source_value IS DISTINCT FROM s.note_type
+            OR encode(sha256(convert_to(n.note_text,'UTF8')),'hex') IS DISTINCT FROM s.text_sha256
+            OR n.visit_occurrence_id IS DISTINCT FROM s.visit_occurrence_id
+            OR (s.load_status = 'LOADED' AND (
+                n.note_date IS DISTINCT FROM s.charttime::date OR n.note_datetime IS DISTINCT FROM s.charttime
+                OR n.note_type_concept_id <> 32817 OR n.note_class_concept_id IS DISTINCT FROM s.note_class_concept_id
+                OR n.note_title IS DISTINCT FROM s.note_title OR n.encoding_concept_id <> 32678
+                OR n.language_concept_id <> 4180186 OR n.provider_id IS NOT NULL
+                OR n.visit_detail_id IS DISTINCT FROM s.existing_visit_detail_id))))),
+    ('only_note_permanent_rows_changed', (
+        SELECT count(*) = 0 FROM pg_stat_xact_user_tables WHERE schemaname NOT LIKE 'pg_temp_%'
+          AND (schemaname, relname) <> (:'cdm_schema', 'note')
+          AND n_tup_ins + n_tup_upd + n_tup_del > 0));
+\if :{?audit_file}
+COPY (SELECT s.source_table,s.source_note_id,s.study_id,s.component_kind,s.subject_id,s.hadm_id,
+    s.note_id,s.reuse_note_id,s.person_id,s.charttime,s.storetime,s.timestamp_basis,
+    s.text_sha256,s.text_bytes,s.load_status,s.visit_status,s.visit_candidate_count,
+    s.existing_visit_id,s.visit_occurrence_id,s.existing_note_date,s.reused_note_date,s.reused_note_datetime,s.match_method,c.action,
+    CASE WHEN s.load_status = 'REUSED_EXISTING_RADIOLOGY' THEN s.reuse_note_id
+         WHEN s.load_status IN ('LOADED','LEGACY_DATE_PROXY_RETAINED') THEN s.note_id END AS target_note_id
+    FROM lk_note_mapped s LEFT JOIN note_changes c USING (note_id) ORDER BY s.source_note_id)
+TO STDOUT WITH (FORMAT CSV, HEADER) \g :audit_file
+\endif
+SELECT jsonb_build_object(
+    'source_table', :'source_table', 'source_rows', (SELECT count(*) FROM src_note),
+    'inserted_rows', (SELECT count(*) FROM note_changes WHERE action = 'INSERT'),
+    'visit_updated_rows', (SELECT count(*) FROM note_changes WHERE action = 'VISIT_UPDATE'),
+    'changed_note_rows', (SELECT count(*) FROM note_changes),
+    'load_status', (SELECT jsonb_object_agg(load_status,n) FROM (SELECT load_status,count(*) n FROM lk_note_mapped GROUP BY 1) x),
+    'visit_status', (SELECT jsonb_object_agg(visit_status,n) FROM (SELECT visit_status,count(*) n FROM lk_note_mapped GROUP BY 1) x),
+    'checks_passed', (SELECT count(*) FROM note_checks)
+)::text AS note_etl_report \gset
 COMMIT;
-
-SELECT 'NOTE_ETL_REPORT ' || row_to_json(r)::text
-FROM :"etl_schema".note_etl_run r WHERE run_id = :run_id;
+\echo NOTE_ETL_REPORT :note_etl_report

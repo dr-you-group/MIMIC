@@ -1,90 +1,51 @@
 -- -------------------------------------------------------------------
 -- MIMIC IV CDM Conversion
--- Validate NOTE and commit the source-specific load
---
--- Dependencies: cdm_note.sql, ext_note.sql, in the same BigQuery job
+-- NOTE-only mapping; same rules as etl/postgres/note.sql.
+-- Temporary work tables only. Run in one workflow_note.conf script.
 -- -------------------------------------------------------------------
 
--- -------------------------------------------------------------------
--- Compare every mapped NOTE field and original text
--- -------------------------------------------------------------------
-
-ASSERT NOT EXISTS (
-    SELECT 1 FROM @etl_project.@etl_dataset.lk_note_mapped w LEFT JOIN @etl_project.@etl_dataset.cdm_note n USING (note_id)
-    WHERE w.person_id IS NOT NULL AND (
-        n.note_id IS NULL OR
-        TO_JSON_STRING(STRUCT(n.person_id, n.note_date, n.note_datetime, n.note_type_concept_id,
-            n.note_class_concept_id, n.note_title, n.encoding_concept_id, n.language_concept_id,
-            n.provider_id, n.visit_occurrence_id, n.visit_detail_id, n.note_source_value,
-            LOWER(TO_HEX(SHA256(n.note_text))) AS text_sha256, BYTE_LENGTH(n.note_text) AS text_bytes))
-        != TO_JSON_STRING(STRUCT(w.person_id, DATE(w.charttime) AS note_date,
-            CASE WHEN w.source_table = 'cxr' THEN CAST(NULL AS DATETIME)
-                 ELSE w.charttime END AS note_datetime, 32817 AS note_type_concept_id, w.note_class_concept_id,
-            w.note_title, 32678 AS encoding_concept_id, 4180186 AS language_concept_id,
-            CAST(NULL AS INT64) AS provider_id, w.visit_occurrence_id,
-            CAST(NULL AS INT64) AS visit_detail_id, w.note_type AS note_source_value,
-            w.text_sha256, w.text_bytes))
+ASSERT ((
+  SELECT
+    COUNT(*) = 0
+  FROM lk_note_mapped AS s
+  LEFT JOIN @etl_project.@etl_dataset.cdm_note AS n
+    USING (note_id)
+  WHERE
+    s.load_status IN ('LOADED', 'LEGACY_DATE_PROXY_RETAINED')
+    AND (
+      n.note_id IS NULL
+      OR n.person_id IS DISTINCT FROM s.person_id
+      OR n.note_source_value IS DISTINCT FROM s.note_type
+      OR LOWER(TO_HEX(SHA256(n.note_text))) IS DISTINCT FROM s.text_sha256
+      OR n.visit_occurrence_id IS DISTINCT FROM s.visit_occurrence_id
+      OR (
+        s.load_status = 'LOADED'
+        AND (
+          n.note_date IS DISTINCT FROM CAST(s.charttime AS DATE)
+          OR n.note_datetime IS DISTINCT FROM s.charttime
+          OR n.note_type_concept_id <> 32817
+          OR n.note_class_concept_id IS DISTINCT FROM s.note_class_concept_id
+          OR n.note_title IS DISTINCT FROM s.note_title
+          OR n.encoding_concept_id <> 32678
+          OR n.language_concept_id <> 4180186
+          OR n.provider_id IS NOT NULL
+          OR n.visit_detail_id IS DISTINCT FROM s.existing_visit_detail_id
+        )
+      )
     )
-) AS 'Loaded NOTE differs from source or mapping';
-ASSERT (
-    SELECT COUNT(*) FROM @etl_project.@etl_dataset.cdm_note n
-    JOIN @etl_project.@etl_dataset.ext_note_id_map m USING (note_id)
-    WHERE m.source_table = '@note_source_table'
-) = (SELECT COUNT(*) FROM @etl_project.@etl_dataset.lk_note_mapped WHERE person_id IS NOT NULL) AS 'Owned NOTE row count mismatch';
+)) AS 'loaded_rows_match_source';
 
--- -------------------------------------------------------------------
--- Compare all detail fields, including duplicate rows
--- -------------------------------------------------------------------
-ASSERT NOT EXISTS (
-    SELECT 1 FROM @etl_project.@etl_dataset.ext_note_detail det
-    LEFT JOIN @etl_project.@etl_dataset.lk_note_mapped src
-        ON src.source_note_id = det.source_note_id
-    WHERE det.source_table = '@note_source_table'
-      AND det.note_id IS DISTINCT FROM src.note_id
-) AS 'Incorrect detail NOTE link';
-
-ASSERT NOT EXISTS (
-    WITH source_groups AS (
-        SELECT source_note_id, subject_id, field_name, field_value, field_ordinal, COUNT(*) AS n
-        FROM @etl_project.@etl_dataset.src_note_detail GROUP BY 1,2,3,4,5
-    ), target_groups AS (
-        SELECT source_note_id, subject_id, field_name, field_value, field_ordinal, COUNT(*) AS n
-        FROM @etl_project.@etl_dataset.ext_note_detail
-        WHERE source_table = '@note_source_table' GROUP BY 1,2,3,4,5
-    )
-    SELECT * FROM source_groups EXCEPT DISTINCT SELECT * FROM target_groups
-) AS 'Missing or changed detail rows';
-ASSERT NOT EXISTS (
-    WITH source_groups AS (
-        SELECT source_note_id, subject_id, field_name, field_value, field_ordinal, COUNT(*) AS n
-        FROM @etl_project.@etl_dataset.src_note_detail GROUP BY 1,2,3,4,5
-    ), target_groups AS (
-        SELECT source_note_id, subject_id, field_name, field_value, field_ordinal, COUNT(*) AS n
-        FROM @etl_project.@etl_dataset.ext_note_detail
-        WHERE source_table = '@note_source_table' GROUP BY 1,2,3,4,5
-    )
-    SELECT * FROM target_groups EXCEPT DISTINCT SELECT * FROM source_groups
-) AS 'Extra detail rows';
-
--- -------------------------------------------------------------------
--- Record a successful run and commit
--- -------------------------------------------------------------------
-
-INSERT INTO @etl_project.@etl_dataset.ext_note_etl_run
-(
-    run_id, finished_at, source_table, source_version, source_sha256,
-    source_rows, loaded_rows, rejected_person_rows, missing_visit_rows,
-    no_hadm_rows, detail_rows, text_mismatches, unmatched_detail_rows
-)
-SELECT GENERATE_UUID(), CURRENT_TIMESTAMP(), '@note_source_table', '@note_source_version',
-    NULLIF('@note_source_sha256', ''), COUNT(*), COUNTIF(load_status = 'LOADED'),
-    COUNTIF(load_status = 'MISSING_PERSON'), COUNTIF(visit_status = 'MISSING_VISIT'),
-    COUNTIF(visit_status = 'NO_HADM_ID'),
-    (SELECT COUNT(*) FROM @etl_project.@etl_dataset.src_note_detail), 0,
-    (SELECT COUNT(*) FROM @etl_project.@etl_dataset.ext_note_detail
-     WHERE source_table = '@note_source_table' AND note_id IS NULL)
-FROM @etl_project.@etl_dataset.lk_note_mapped;
 COMMIT TRANSACTION;
 
-SELECT * FROM @etl_project.@etl_dataset.ext_note_etl_run
-WHERE source_table = '@note_source_table' ORDER BY finished_at DESC LIMIT 1;
+-- Capture these child-job query results outside the CDM for source identity,
+-- withheld rows, legacy date exceptions and every changed visit.
+SELECT s.source_table,s.source_note_id,s.study_id,s.component_kind,s.subject_id,s.hadm_id,
+    s.note_id,s.reuse_note_id,s.person_id,s.charttime,s.storetime,s.timestamp_basis,
+    s.text_sha256,s.text_bytes,s.load_status,s.visit_status,s.visit_candidate_count,
+    s.existing_visit_id,s.visit_occurrence_id,s.existing_note_date,s.reused_note_date,s.reused_note_datetime,s.match_method,c.action,
+    CASE WHEN s.load_status = 'REUSED_EXISTING_RADIOLOGY' THEN s.reuse_note_id
+         WHEN s.load_status IN ('LOADED','LEGACY_DATE_PROXY_RETAINED') THEN s.note_id END AS target_note_id
+FROM lk_note_mapped s LEFT JOIN note_changes c USING (note_id)
+ORDER BY s.source_note_id;
+SELECT source_table,load_status,visit_status,COUNT(*) AS rows
+FROM lk_note_mapped GROUP BY 1,2,3 ORDER BY 1,2,3;
