@@ -6,7 +6,9 @@ The project implements an ETL conversion of MIMIC IV PhysioNet dataset to OMOP C
 
 * Version 1.0.0
 
-Optional MIMIC-IV-Note support is documented in
+The [NOTE ETL guide](NOTE_ETL.md) describes discharge, radiology, CXR, ECG and
+Echo mappings with diagrams and source-to-NOTE document/patient flow counts.
+Execution details for optional MIMIC-IV-Note support are documented in
 [NOTE ETL](docs/note_etl.md). It adds a source-specific BigQuery workflow and
 equivalent PostgreSQL queries for an existing CDM, preserving Core person and
 visit identifiers. The current add-on writes only NOTE, uses temporary working
