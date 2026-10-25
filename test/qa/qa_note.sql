@@ -18,7 +18,8 @@ ASSERT NOT EXISTS (
             n.provider_id, n.visit_occurrence_id, n.visit_detail_id, n.note_source_value,
             LOWER(TO_HEX(SHA256(n.note_text))) AS text_sha256, BYTE_LENGTH(n.note_text) AS text_bytes))
         != TO_JSON_STRING(STRUCT(w.person_id, DATE(w.charttime) AS note_date,
-            w.charttime AS note_datetime, 32817 AS note_type_concept_id, w.note_class_concept_id,
+            CASE WHEN w.source_table = 'cxr' THEN CAST(NULL AS DATETIME)
+                 ELSE w.charttime END AS note_datetime, 32817 AS note_type_concept_id, w.note_class_concept_id,
             w.note_title, 32678 AS encoding_concept_id, 4180186 AS language_concept_id,
             CAST(NULL AS INT64) AS provider_id, w.visit_occurrence_id,
             CAST(NULL AS INT64) AS visit_detail_id, w.note_type AS note_source_value,

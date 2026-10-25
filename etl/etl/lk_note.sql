@@ -25,6 +25,8 @@ SELECT 'radiology', 'AR', '68604-8', 'Radiology report addendum'
 UNION ALL
 SELECT 'cxr', 'CXR', '68604-8', 'Chest radiograph report'
 UNION ALL
+SELECT 'cxr', 'CXR_VARIANT', '68604-8', 'Chest radiograph source report (possible duplicate or variant)'
+UNION ALL
 SELECT 'cxr', 'CXR_SUPPLEMENT', '68604-8', 'Chest radiograph supplementary report (preliminary/addendum)'
 UNION ALL
 SELECT 'ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation'

@@ -101,7 +101,9 @@ SELECT
     src.note_id                                 AS note_id,
     src.person_id                               AS person_id,
     CAST(src.charttime AS DATE)                 AS note_date,
-    src.charttime                               AS note_datetime,
+    -- CXR supplies acquisition time, not document recording time.
+    CASE WHEN src.source_table = 'cxr' THEN CAST(NULL AS DATETIME)
+         ELSE src.charttime END                 AS note_datetime,
     32817                                       AS note_type_concept_id, -- EHR
     src.note_class_concept_id                   AS note_class_concept_id,
     src.note_title                              AS note_title,

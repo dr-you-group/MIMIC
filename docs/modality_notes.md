@@ -7,7 +7,7 @@ these queries directly against the existing CDM. Existing Core IDs are retained.
 
 | Source | Implemented action | NOTE source / LOINC |
 | --- | --- | --- |
-| CXR 2.1.0 | Reuse resolved radiology documents and add non-overlapping reports and supplementary source text | CXR, CXR_SUPPLEMENT / 68604-8 |
+| CXR 2.1.0 | Reuse resolved radiology documents; retain additional reports, supplements, and unresolved source variants | CXR, CXR_SUPPLEMENT, CXR_VARIANT / 68604-8 |
 | ECG 1.0 | Construct machine interpretation documents from 18 original report fields | ECG_MACHINE / 75425-9 |
 | Echo 1.0.1 | Preserve study/report linkage and validation status; no NOTE without narrative | NO_REPORT_BODY |
 
@@ -33,10 +33,14 @@ using its linkage as validated data.
 ## CXR rules
 
 A study may have several images; do not create one NOTE per image. `study_id`
-is not `hadm_id`. New CXR notes use the earliest image acquisition time as an
-explicit proxy. It is **not the authoring, signing, or availability time** of a
-final, preliminary, or supplementary report. `storetime` stays NULL. Do not use
-this proxy alone to determine whether a document was available for prediction.
+is not `hadm_id`. New CXR notes use the earliest image acquisition **date** as
+an explicit proxy for the required `note_date`. The document recording time is
+unknown, so `note_datetime` and `storetime` are NULL. Full acquisition times
+remain in raw metadata, `note_metadata.charttime`, and component/study links.
+They are **not the authoring, signing, or availability time** of a final,
+preliminary, or supplementary report. Do not use the proxy date alone to decide
+whether a document was available for prediction. Existing RR/AR aliases keep
+their original document date and time.
 
 ### Match the final report
 
@@ -59,7 +63,10 @@ similarity nor an inferred reconstruction of masked text is an identity rule.
 
 Select the best available priority for each study, then require uniqueness in
 both directions across those candidates. Already resolved legacy reports cannot
-be claimed by a new study. Ambiguous or time-distant matches remain reviewable.
+be claimed by a new study. A final fallback permits **whole normalized source
+text equality within 48 hours**, with uniqueness in both directions and no
+previously claimed report. This wider window never applies to clinical-body,
+prefix, or masked comparisons. Ambiguous or time-distant matches remain reviewable.
 `cxr_reconciliation` records the method, count, and decision. Existing NOTE text,
 patient, visit, and document time stay unchanged. Original CXR text is retained
 even when its header or masks differ from the linked radiology document.
@@ -87,8 +94,9 @@ that differs from an existing AR remains a separately identified source
 variant, not a silent replacement of that AR.
 
 For an eligible new CXR report, preserve the **whole original file** as one
-`REPORT`, including any prefix. Unresolved bundles are likewise retained whole
-in the extension; their uncertain final report is not automatically inserted.
+`REPORT`, including any prefix. An unresolved bundle is retained whole as a
+`CXR_VARIANT` NOTE. It is not split around an unproven final-report relationship;
+all preliminary/addendum text stays in its source order without a fabricated parent.
 
 ### Admit additional source reports
 
@@ -105,6 +113,28 @@ This is a reproducible source-coverage rule, not proof that no corresponding
 clinical document exists elsewhere. The wider exclusion window reduces
 insertion of delayed versions of existing reports. Mere lack of an exact hash
 match does not qualify a report that overlaps an existing episode.
+
+### Preserve unresolved source versions
+
+After exact reconciliation and the source-coverage rules, a source with valid
+image times is `NEW_SOURCE_VARIANT`. If its PERSON exists, load its entire
+original text using the same stable CXR document ID and LOINC class, but set
+`note_source_value = 'CXR_VARIANT'`. Its title explicitly states possible
+duplicate/variant; `note_detail.duplicate_status` is
+`UNRESOLVED_POSSIBLE_DUPLICATE`, and the study/component status is
+`LOADED_SOURCE_VARIANT`. This records an authentic source document, **not an
+additional confirmed clinical event**. No inferred unmasking, negation change,
+or fuzzy merging is performed. The count of added NOTE rows must not be
+reported as a count of new examinations.
+
+`cxr_overlap_candidate` retains same-patient exact full/final/body/mask
+candidates across the available history and chest-report candidates within
+48 hours. `comparison_basis` and `time_gap_seconds` describe the evidence.
+`cxr_overlap_note_link` adds candidate NOTE IDs with relationship status
+`POSSIBLE_DUPLICATE_NOT_CONFIRMED`; this is not a confirmed `FACT_RELATIONSHIP`.
+Missing candidates do not establish novelty. For an analysis requiring one
+resolved document per study, omit `CXR_VARIANT` or adjudicate these links first;
+for source-version analysis, retain the variant text and its uncertainty.
 
 ### Account for every character and link
 
@@ -157,12 +187,13 @@ The positive 60-bit SHA-256 prefix uses these UTF-8 inputs:
 | Source | Stable identity input |
 | --- | --- |
 | discharge/radiology, unchanged | `mimic-iv-note\|<source_table>\|<source_note_id>` |
-| New whole CXR | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>` |
+| Whole CXR, including source variants | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>` |
 | CXR supplement | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>-PREFIX` |
 | ECG machine | `mimic-iv-ecg\|ecg_machine\|<subject_id>-ECG_MACHINE-<study_id>` |
 
-Version/checksum are provenance, not identity. No new NOTE ID is allocated
-for Echo or unresolved aliases. NOTE_NLP remains a separate workflow.
+Version/checksum are provenance, not identity. Echo has no NOTE ID without
+a narrative; candidate links do not allocate radiology aliases. A preserved
+CXR source variant owns its own NOTE ID. NOTE_NLP remains a separate workflow.
 
 ## PostgreSQL
 
@@ -192,6 +223,36 @@ of every pre-existing NOTE before and after. Compare final NOTE fingerprints
 and modality/component links between databases running the same revision.
 Use `--sources cxr` to update only CXR after ECG has already been loaded;
 the existing ECG and Echo linkage is still verified.
+
+When upgrading from the former acquisition-time `note_datetime` mapping, pass
+`--clear-cxr-proxy-datetime` once. The runner captures both the original row
+fingerprints and the expected fingerprints with **only CXR note_datetime set
+to NULL**, then compares every pre-existing row against that expectation.
+It records the number of corrections and rejects any other change. The source
+acquisition times and NOTE IDs/text/date remain unchanged. Later runs without
+this flag must preserve all 14 fields exactly.
+
+After all sources finish, run the complete NOTE convention checks:
+
+```sh
+psql -X -v ON_ERROR_STOP=1 \
+  -v cdm_schema=mimiciv -v etl_schema=mimiciv_note_etl \
+  -f etl/postgres/qa_note.sql
+```
+
+This read-only audit checks required values, document/type/language concepts,
+field widths, uniqueness, all NOTE foreign keys, patient/admission mappings,
+modality coverage, unknown CXR document times, and source-variant flags.
+Source-specific `note.sql` additionally checks every mapped field, text hash,
+byte length, and detail row. These checks validate this NOTE add-on; they are
+not an audit or version upgrade of the entire Core CDM.
+
+The existing Core observation periods are retained. The OMOP
+[observation-period convention](https://ohdsi.github.io/CommonDataModel/cdm53.html#observation_period)
+allows recorded events outside them; an isolated report does not establish
+continuous capture of other events. Downstream incidence or prevalence
+analyses must respect observation periods instead of interpreting an earlier
+CXR/ECG report as evidence of uninterrupted observation.
 
 ## BigQuery
 

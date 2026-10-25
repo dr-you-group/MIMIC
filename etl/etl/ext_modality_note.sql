@@ -38,8 +38,9 @@ SELECT
     CASE
         WHEN per.person_id IS NULL THEN 'MISSING_PERSON'
         WHEN link.decision = 'MATCHED_RADIOLOGY' AND nt.note_id IS NOT NULL THEN 'LINKED_EXISTING'
+        WHEN link.decision = 'NEW_SOURCE_VARIANT' AND nt.note_id IS NOT NULL THEN 'LOADED_SOURCE_VARIANT'
         WHEN link.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY') AND nt.note_id IS NOT NULL THEN 'LOADED'
-        WHEN link.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY') THEN 'ERROR_NOTE_NOT_LOADED'
+        WHEN link.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SOURCE_VARIANT') THEN 'ERROR_NOTE_NOT_LOADED'
         ELSE link.decision
     END                                         AS load_status,
     link.match_method                           AS match_method,
@@ -169,9 +170,10 @@ SELECT
     CASE
         WHEN study.person_id IS NULL THEN 'MISSING_PERSON'
         WHEN comp.decision = 'MATCHED_RADIOLOGY' AND nt.note_id IS NOT NULL THEN 'LINKED_EXISTING'
+        WHEN comp.decision = 'NEW_SOURCE_VARIANT' AND nt.note_id IS NOT NULL THEN 'LOADED_SOURCE_VARIANT'
         WHEN comp.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
             AND nt.note_id IS NOT NULL THEN 'LOADED'
-        WHEN comp.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+        WHEN comp.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT','NEW_SOURCE_VARIANT')
             THEN 'ERROR_NOTE_NOT_LOADED'
         ELSE comp.decision
     END AS load_status,
@@ -192,12 +194,17 @@ ASSERT (NOT EXISTS (
     )) AS 'same_person_component_links';
 ASSERT (NOT EXISTS (
         SELECT 1 FROM lk_cxr_note_component c INNER JOIN @etl_project.@etl_dataset.cdm_note n USING (note_id)
-        WHERE c.load_status = 'LOADED' AND c.text_sha256 <> LOWER(TO_HEX(SHA256(n.note_text)))
+        WHERE c.load_status IN ('LOADED','LOADED_SOURCE_VARIANT')
+          AND c.text_sha256 <> LOWER(TO_HEX(SHA256(n.note_text)))
     )) AS 'loaded_component_text_unchanged';
 ASSERT (NOT EXISTS (
         SELECT 1 FROM @etl_project.@etl_dataset.ext_cxr_note_component old LEFT JOIN lk_cxr_note_component new USING (study_id, component_kind)
         WHERE old.note_id IS NOT NULL AND old.note_id IS DISTINCT FROM new.note_id
     )) AS 'stable_existing_component_links';
+
+-- These are possible overlaps, not asserted clinical-event relationships.
+-- Consumers can exclude CXR_VARIANT for a deduplicated radiology analysis,
+-- or include its unchanged text when studying source-version differences.
 ASSERT (SELECT count(*) = count(DISTINCT TO_JSON_STRING(STRUCT(source_table,study_id)))
     FROM lk_modality_note_link) AS 'Modality link fanout';
 ASSERT (SELECT count(*) = count(DISTINCT TO_JSON_STRING(STRUCT(study_id,component_kind)))
@@ -221,6 +228,18 @@ CREATE OR REPLACE VIEW @etl_project.@etl_dataset.ext_cxr_component_text AS
 SELECT comp.*, substr(raw.text, comp.source_start, comp.source_length) AS source_text
 FROM @etl_project.@etl_dataset.ext_cxr_note_component comp
 INNER JOIN @modality_project.@modality_dataset.cxr_reports raw ON CAST(raw.study_id AS INT64) = comp.study_id;
+CREATE OR REPLACE VIEW @etl_project.@etl_dataset.ext_cxr_overlap_note_link AS
+SELECT
+    candidate.*,
+    study.note_id AS source_variant_note_id,
+    nt.note_id AS candidate_note_id,
+    'POSSIBLE_DUPLICATE_NOT_CONFIRMED' AS relationship_status
+FROM @etl_project.@etl_dataset.ext_cxr_overlap_candidate candidate
+INNER JOIN @etl_project.@etl_dataset.ext_modality_note_link study
+    ON study.source_table = 'cxr' AND study.study_id = candidate.study_id
+LEFT JOIN @etl_project.@etl_dataset.ext_note_id_map map
+    ON map.source_table = 'radiology' AND map.source_note_id = candidate.radiology_note_id
+LEFT JOIN @etl_project.@etl_dataset.cdm_note nt ON nt.note_id = map.note_id AND nt.person_id = study.person_id;
 
 SELECT source_table, load_status, checksum_status, count(*) AS source_rows
 FROM @etl_project.@etl_dataset.ext_modality_note_link

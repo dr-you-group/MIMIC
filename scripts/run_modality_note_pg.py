@@ -1,8 +1,9 @@
 """Run the modality SQL add-on against an existing PostgreSQL CDM.
 
 Uses standard PG* environment variables, Docker postgres:16 and verified raw
-inputs. Captures SQL hashes and every NOTE row before/after; an earlier NOTE
-must retain all 14 mapped fields. No credentials are written to the audit.
+inputs. Captures SQL hashes and every NOTE row before/after. An explicit
+one-time correction can clear CXR proxy datetimes; all other fields must
+remain identical. No credentials are written to the audit.
 """
 import argparse
 import csv
@@ -36,8 +37,10 @@ def command(args):
         '-v','cdm_schema='+args.cdm_schema, '-v','etl_schema='+args.etl_schema]
 
 
-def fingerprint(args, name):
-    fields=['note_id','person_id','note_date','note_datetime','note_type_concept_id',
+def fingerprint(args, name, clear_cxr_datetime=False):
+    time_expr=("CASE WHEN note_source_value IN ('CXR','CXR_SUPPLEMENT','CXR_VARIANT') THEN NULL::timestamp ELSE note_datetime END"
+               if clear_cxr_datetime else 'note_datetime')
+    fields=['note_id','person_id','note_date',time_expr,'note_type_concept_id',
         'note_class_concept_id','note_title',"encode(sha256(convert_to(note_text,'UTF8')),'hex')",
         'encoding_concept_id','language_concept_id','provider_id','visit_occurrence_id',
         'visit_detail_id','note_source_value']
@@ -84,6 +87,14 @@ def main(args):
            'sql_sha256':hashes,'steps':[]}
     save(args.audit/'run.json',state)
     state['before']=fingerprint(args,'note_before');save(args.audit/'run.json',state)
+    if args.clear_cxr_proxy_datetime:
+        if 'cxr' not in args.sources:raise ValueError('CXR datetime correction requires --sources cxr')
+        state['expected_before_after_datetime_correction']=fingerprint(args,'note_expected',True)
+        result=subprocess.run(command(args)+['-c',
+            f"SELECT count(*) FROM {ident(args.cdm_schema)}.note WHERE note_source_value IN ('CXR','CXR_SUPPLEMENT','CXR_VARIANT') AND note_datetime IS NOT NULL;"],
+            text=True,capture_output=True,check=True)
+        state['allowed_cxr_datetime_corrections']=int(result.stdout.strip())
+        save(args.audit/'run.json',state)
     sources={r['table']:r for r in manifest['tables']}
     source_rules={'cxr':('2.1.0','cxr_reports'), 'ecg_machine':('1.0','ecg_machine_measurements')}
     phases=[('st_modality_note.sql',[])]
@@ -109,7 +120,8 @@ def main(args):
         if reports:step['report']=json.loads(reports[-1])
         save(args.audit/'run.json',state);print(json.dumps(step),flush=True)
     state['after']=fingerprint(args,'note_after')
-    state['preexisting_notes_preserved']=preserved(args.audit/'note_before.csv',args.audit/'note_after.csv')
+    expected='note_expected.csv' if args.clear_cxr_proxy_datetime else 'note_before.csv'
+    state['preexisting_notes_preserved']=preserved(args.audit/expected,args.audit/'note_after.csv')
     schema=ident(args.etl_schema)
     query=f"SELECT jsonb_agg(r) FROM (SELECT source_table,load_status,checksum_status,count(*) AS rows FROM {schema}.modality_note_link GROUP BY 1,2,3 ORDER BY 1,2,3) r;"
     result=subprocess.run(command(args)+['-c',query],text=True,capture_output=True,check=True)
@@ -129,4 +141,6 @@ if __name__=='__main__':
     p.add_argument('--etl-schema',default='mimiciv_note_etl')
     p.add_argument('--sources',nargs='+',choices=['cxr','ecg_machine'],default=['cxr','ecg_machine'],
                    help='NOTE sources to load; omitted sources must already have completed their NOTE ETL')
+    p.add_argument('--clear-cxr-proxy-datetime',action='store_true',
+                   help='Allow only clearing CXR note_datetime; preserve source acquisition time in the extension')
     main(p.parse_args())

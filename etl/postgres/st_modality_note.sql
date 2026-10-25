@@ -292,6 +292,35 @@ WHERE study_candidates = 1 AND report_candidates = 1;
 CREATE UNIQUE INDEX ON lk_cxr_match(study_id);
 CREATE UNIQUE INDEX ON lk_cxr_match(radiology_note_id);
 
+-- Exact whole-document equality can bridge delayed report charting. A
+-- wider window is never used for body-only or masked-text comparison.
+-- Previously resolved documents keep ownership; both directions must
+-- be unique among the remaining studies and reports.
+CREATE TEMP TABLE lk_cxr_late_candidate ON COMMIT DROP AS
+SELECT
+    cxr.study_id                                AS study_id,
+    rad.source_note_id                          AS radiology_note_id,
+    count(*) OVER (PARTITION BY cxr.study_id)     AS study_candidates,
+    count(*) OVER (PARTITION BY rad.source_note_id) AS report_candidates
+FROM src_cxr_study cxr
+INNER JOIN src_cxr_radiology rad
+    ON rad.subject_id = cxr.subject_id AND rad.note_type = 'RR'
+    AND rad.full_hash = cxr.full_hash
+    AND rad.charttime BETWEEN cxr.study_datetime - interval '48 hours' AND cxr.study_end + interval '48 hours'
+WHERE cxr.missing_times = 0 AND cxr.study_end - cxr.study_datetime <= interval '6 hours'
+    AND NOT EXISTS (SELECT 1 FROM lk_cxr_match old WHERE old.study_id = cxr.study_id)
+    AND NOT EXISTS (SELECT 1 FROM lk_cxr_match old WHERE old.radiology_note_id = rad.source_note_id)
+    AND EXISTS (
+        SELECT 1 FROM src_cxr_time tm WHERE tm.study_id = cxr.study_id
+          AND abs(extract(epoch FROM rad.charttime - tm.study_datetime)) <= 172800
+    )
+;
+CREATE INDEX ON lk_cxr_late_candidate(study_id);
+INSERT INTO lk_cxr_match
+SELECT study_id, radiology_note_id, 'FULL_TEXT_WITHIN_48H'
+FROM lk_cxr_late_candidate WHERE study_candidates = 1 AND report_candidates = 1;
+ANALYZE lk_cxr_match;
+
 -- Absence of a nearby report alone is insufficient: a known exact full,
 -- final, clinical-body or mask-only match anywhere in the patient blocks
 -- insertion. Seven days is deliberately wider than the matching window.
@@ -330,12 +359,13 @@ SELECT
         WHEN NOT EXISTS (SELECT 1 FROM src_cxr_radiology r WHERE r.subject_id = cxr.subject_id)
             THEN 'NEW_NO_PATIENT_RADIOLOGY'
         WHEN novel.study_id IS NOT NULL THEN 'NEW_NO_NEARBY_RADIOLOGY'
-        ELSE 'REVIEW_OVERLAP'
+        ELSE 'NEW_SOURCE_VARIANT'
     END                                         AS decision,
     match.radiology_note_id                      AS radiology_note_id,
     match.match_method                          AS match_method,
-    CASE WHEN legacy.study_id IS NOT NULL THEN 1 ELSE
-        (SELECT count(*) FROM lk_cxr_extended_candidate c WHERE c.study_id = cxr.study_id)
+    CASE WHEN legacy.study_id IS NOT NULL THEN 1 ELSE greatest(
+        (SELECT count(*) FROM lk_cxr_extended_candidate c WHERE c.study_id = cxr.study_id),
+        (SELECT count(*) FROM lk_cxr_late_candidate c WHERE c.study_id = cxr.study_id))
     END                                         AS candidate_count
 FROM
     src_cxr_study cxr
@@ -351,12 +381,55 @@ INSERT INTO modality_checks VALUES
     ('stable_existing_resolution', NOT EXISTS (
         SELECT 1 FROM :"etl_schema".cxr_reconciliation old
         LEFT JOIN lk_cxr_resolution new USING (study_id)
-        WHERE old.decision IN ('MATCHED_RADIOLOGY', 'NEW_NO_PATIENT_RADIOLOGY', 'NEW_NO_NEARBY_RADIOLOGY')
+        WHERE old.decision IN ('MATCHED_RADIOLOGY', 'NEW_NO_PATIENT_RADIOLOGY', 'NEW_NO_NEARBY_RADIOLOGY', 'NEW_SOURCE_VARIANT')
           AND (new.study_id IS NULL OR (old.decision, old.radiology_note_id)
               IS DISTINCT FROM (new.decision, new.radiology_note_id))
     ));
 DELETE FROM :"etl_schema".cxr_reconciliation;
 INSERT INTO :"etl_schema".cxr_reconciliation SELECT * FROM lk_cxr_resolution;
+
+-- -------------------------------------------------------------------
+-- lk_cxr_overlap_candidate
+-- Retain unresolved source versions as NOTE documents, without claiming
+-- that a nearby/fuzzy candidate is the same document or a new event.
+-- Candidate links below are evidence only; they never allocate an alias.
+-- Whole-text candidates are retained even outside the identity window.
+-- -------------------------------------------------------------------
+
+CREATE TEMP TABLE lk_cxr_overlap_candidate ON COMMIT DROP AS
+SELECT
+    cxr.subject_id                              AS subject_id,
+    cxr.study_id                                AS study_id,
+    rad.source_note_id                          AS radiology_note_id,
+    rad.charttime                               AS radiology_datetime,
+    CASE
+        WHEN cxr.full_hash = rad.full_hash THEN 'FULL_TEXT'
+        WHEN cxr.final_hash = rad.full_hash THEN 'FINAL_TEXT'
+        WHEN cxr.final_body_hash = rad.body_hash THEN 'CLINICAL_BODY'
+        WHEN cxr.mask_body_hash = rad.mask_body_hash THEN 'MASK_ONLY_BODY'
+        ELSE 'NEARBY_CHEST_REPORT'
+    END                                         AS comparison_basis,
+    CAST((SELECT min(abs(extract(epoch FROM rad.charttime - tm.study_datetime)))
+        FROM src_cxr_time tm WHERE tm.study_id = cxr.study_id) AS double precision) AS time_gap_seconds
+FROM src_cxr_study cxr
+INNER JOIN lk_cxr_resolution res USING (study_id)
+INNER JOIN src_cxr_radiology rad
+    ON rad.subject_id = cxr.subject_id AND rad.note_type = 'RR'
+    AND (rad.full_hash IN (cxr.full_hash, cxr.final_hash)
+         OR rad.body_hash = cxr.final_body_hash OR rad.mask_body_hash = cxr.mask_body_hash
+         OR (rad.chest_exam AND rad.charttime BETWEEN
+             cxr.study_datetime - interval '48 hours' AND cxr.study_end + interval '48 hours'))
+WHERE res.decision = 'NEW_SOURCE_VARIANT'
+;
+CREATE UNIQUE INDEX ON lk_cxr_overlap_candidate(study_id, radiology_note_id);
+ANALYZE lk_cxr_overlap_candidate;
+CREATE TABLE IF NOT EXISTS :"etl_schema".cxr_overlap_candidate (
+    subject_id integer NOT NULL, study_id integer NOT NULL, radiology_note_id text NOT NULL,
+    radiology_datetime timestamp, comparison_basis text NOT NULL, time_gap_seconds double precision,
+    PRIMARY KEY (study_id, radiology_note_id)
+);
+DELETE FROM :"etl_schema".cxr_overlap_candidate;
+INSERT INTO :"etl_schema".cxr_overlap_candidate SELECT * FROM lk_cxr_overlap_candidate;
 
 -- -------------------------------------------------------------------
 -- lk_cxr_component
@@ -438,7 +511,7 @@ INSERT INTO modality_checks VALUES
     )),
     ('stable_existing_components', NOT EXISTS (
         SELECT 1 FROM :"etl_schema".cxr_component old LEFT JOIN lk_cxr_component new USING (study_id, component_kind)
-        WHERE old.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+        WHERE old.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT','NEW_SOURCE_VARIANT')
           AND (new.study_id IS NULL OR (old.source_note_id,old.source_start,old.source_length,old.decision,old.radiology_note_id)
               IS DISTINCT FROM (new.source_note_id,new.source_start,new.source_length,new.decision,new.radiology_note_id))
     ));
@@ -455,7 +528,9 @@ SELECT
     comp.source_note_id                         AS note_id,
     link.subject_id                             AS subject_id,
     CAST(NULL AS integer)                       AS hadm_id,
-    CASE WHEN comp.component_kind = 'PREFIX' THEN 'CXR_SUPPLEMENT' ELSE 'CXR' END AS note_type,
+    CASE WHEN comp.component_kind = 'PREFIX' THEN 'CXR_SUPPLEMENT'
+         WHEN comp.decision = 'NEW_SOURCE_VARIANT' THEN 'CXR_VARIANT'
+         ELSE 'CXR' END                          AS note_type,
     0                                           AS note_seq,
     link.study_datetime                         AS charttime,
     CAST(NULL AS timestamp)                     AS storetime,
@@ -467,7 +542,7 @@ INNER JOIN
 INNER JOIN
     :"etl_schema".cxr_component comp ON comp.study_id = link.study_id
 WHERE
-    comp.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+    comp.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT','NEW_SOURCE_VARIANT')
 ;
 CREATE OR REPLACE VIEW :"source_schema".cxr_detail AS
 SELECT
@@ -482,6 +557,9 @@ INNER JOIN :"source_schema".cxr_reports raw ON CAST(raw.study_id AS integer) = c
 UNION ALL
 SELECT src.note_id, src.subject_id, 'timestamp_basis', 'STUDY_ACQUISITION_TIME_NOT_DOCUMENT_AVAILABILITY', 1
 FROM :"source_schema".cxr src
+UNION ALL
+SELECT src.note_id, src.subject_id, 'duplicate_status', 'UNRESOLVED_POSSIBLE_DUPLICATE', 1
+FROM :"source_schema".cxr src WHERE src.note_type = 'CXR_VARIANT'
 ;
 
 CREATE OR REPLACE VIEW :"source_schema".ecg_machine AS

@@ -264,13 +264,13 @@ class PostgresNoteTests(unittest.TestCase):
         self.run_modality('st_modality_note.sql')
         cxr = self.run_etl('cxr',source_schema='modality')
         ecg = self.run_etl('ecg_machine',source_schema='modality')
-        self.assertEqual((cxr['source_rows'],cxr['loaded_rows']),(2,1))
+        self.assertEqual((cxr['source_rows'],cxr['loaded_rows']),(3,2))
         self.assertEqual((ecg['source_rows'],ecg['loaded_rows']),(2,1))
         self.run_modality('ext_modality_note.sql')
-        self.assertEqual(self.sql('SELECT count(*) FROM cdm.note'),'7')
+        self.assertEqual(self.sql('SELECT count(*) FROM cdm.note'),'8')
         self.assertEqual(self.sql("SELECT count(*) FROM cdm.note WHERE note_source_value IN ('DS','AD','RR','AR')"),'5')
         self.assertEqual(self.sql("SELECT load_status FROM note_audit.modality_note_link WHERE study_id=501"),'LINKED_EXISTING')
-        self.assertEqual(self.sql("SELECT load_status FROM note_audit.modality_note_link WHERE study_id=502"),'REVIEW_OVERLAP')
+        self.assertEqual(self.sql("SELECT load_status FROM note_audit.modality_note_link WHERE study_id=502"),'LOADED_SOURCE_VARIANT')
         self.assertEqual(self.sql("SELECT note_id FROM note_audit.modality_note_link WHERE study_id=501"),str(note_id('radiology','101-RR-1')))
         self.assertEqual(self.sql("SELECT count(*) FROM note_audit.modality_note_link WHERE source_table='echo' AND note_id IS NULL AND checksum_status='CHECKSUM_MISMATCH'"),'2')
         expected = int(hashlib.sha256(b'mimic-iv-ecg|ecg_machine|101-ECG_MACHINE-601').hexdigest()[:15],16)
@@ -285,13 +285,17 @@ class PostgresNoteTests(unittest.TestCase):
         self.run_modality('ext_modality_note.sql')
         self.assertEqual(self.sql('SELECT count(*) FROM note_audit.modality_note_link'),'9')
 
-    def test_cxr_ambiguous_repeated_text_is_not_merged_or_inserted(self):
+    def test_cxr_ambiguous_repeated_text_is_preserved_without_a_false_alias(self):
         self.modality_fixture()
         self.sql("""INSERT INTO modality.cxr_reports SELECT subject_id,'505',text FROM modality.cxr_reports WHERE study_id='501';
             INSERT INTO modality.cxr_study_list VALUES ('101','505');
             INSERT INTO modality.cxr_metadata VALUES ('101','505','21000101','000000.125');""")
         self.run_modality('st_modality_note.sql')
-        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.cxr_reconciliation WHERE study_id IN (501,505) AND decision='REVIEW_OVERLAP'"),'2')
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.cxr_reconciliation WHERE study_id IN (501,505) AND decision='NEW_SOURCE_VARIANT' AND radiology_note_id IS NULL"),'2')
+        self.run_etl('cxr',source_schema='modality')
+        self.run_etl('ecg_machine',source_schema='modality')
+        self.run_modality('ext_modality_note.sql')
+        self.assertEqual(self.sql("SELECT count(DISTINCT source_variant_note_id) FROM note_audit.cxr_overlap_note_link WHERE study_id IN (501,505) AND candidate_note_id IS NOT NULL AND relationship_status='POSSIBLE_DUPLICATE_NOT_CONFIRMED'"),'2')
 
     def test_cxr_clinical_body_requires_exam_time_and_unique_pair(self):
         self.modality_fixture()
@@ -358,9 +362,9 @@ class PostgresNoteTests(unittest.TestCase):
     def test_cxr_mask_rule_keeps_negation_numbers_and_punctuation(self):
         body='FINDINGS: No pleural effusion. Cardiac size is normal. A 3.1 cm opacity in the left lung is unchanged.'
         cases=[(body.replace('effusion.','effusion. ___'),'MATCHED_RADIOLOGY'),
-               (body.replace('No pleural','___ pleural'),'REVIEW_OVERLAP'),
-               (body.replace('3.1','3.___1'),'REVIEW_OVERLAP'),
-               (body.replace('3.1','3.2'),'REVIEW_OVERLAP')]
+               (body.replace('No pleural','___ pleural'),'NEW_SOURCE_VARIANT'),
+               (body.replace('3.1','3.___1'),'NEW_SOURCE_VARIANT'),
+               (body.replace('3.1','3.2'),'NEW_SOURCE_VARIANT')]
         for variant,expected in cases:
             with self.subTest(expected=expected,variant=variant):
                 self.setUp()
@@ -372,6 +376,9 @@ class PostgresNoteTests(unittest.TestCase):
                 self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),expected)
                 if expected=='MATCHED_RADIOLOGY':
                     self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'MASK_ONLY_BODY_CHEST_WITHIN_1H')
+                else:
+                    self.run_etl('cxr',source_schema='modality')
+                    self.assertEqual(self.sql("SELECT note_text FROM cdm.note n JOIN note_audit.note_id_map m USING(note_id) WHERE m.source_note_id='101-CXR-501'"),'Different indication. '+variant)
 
     def test_cxr_new_report_requires_temporal_and_text_exclusion(self):
         self.modality_fixture()
@@ -380,14 +387,59 @@ class PostgresNoteTests(unittest.TestCase):
             UPDATE modality.cxr_metadata SET studydate='21000201' WHERE study_id IN ('501','502');""")
         self.run_modality('st_modality_note.sql')
         self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),'NEW_NO_NEARBY_RADIOLOGY')
-        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=502"),'REVIEW_OVERLAP')
+        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=502"),'NEW_SOURCE_VARIANT')
 
     def test_zero_new_cxr_documents_is_valid(self):
         self.modality_fixture()
-        self.sql("DELETE FROM modality.cxr_reports WHERE study_id IN ('503','504'); DELETE FROM modality.cxr_study_list WHERE study_id IN ('503','504');")
+        self.sql("DELETE FROM modality.cxr_reports WHERE study_id IN ('502','503','504'); DELETE FROM modality.cxr_study_list WHERE study_id IN ('502','503','504');")
         self.run_modality('st_modality_note.sql')
         result=self.run_etl('cxr',source_schema='modality')
         self.assertEqual((result['source_rows'],result['loaded_rows']),(0,0))
+
+    def test_cxr_delayed_exact_full_text_requires_unique_unowned_report(self):
+        self.modality_fixture()
+        self.sql("UPDATE modality.cxr_metadata SET studydate='21000102',studytime='120000' WHERE study_id='501'")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'FULL_TEXT_WITHIN_48H')
+        self.sql("UPDATE modality.cxr_reports SET text=E'FINAL REPORT\\nRadiology\\nreport' WHERE study_id='502'")
+        # The original 501 now competes with a higher-priority same-day study.
+        # Established links may not be reassigned on a later run.
+        self.assertIn('stable_existing_resolution',self.run_modality('st_modality_note.sql',success=False).stderr)
+
+    def test_cxr_composite_variant_is_retained_whole_with_unknown_document_time(self):
+        self.modality_fixture()
+        value='WET READ: Small pleural effusion.\n__________\nFINAL REPORT\nFINDINGS: No pleural effusion.'
+        self.sql("UPDATE modality.cxr_reports SET text='"+value+"' WHERE study_id='502'")
+        self.run_modality('st_modality_note.sql')
+        self.run_etl('cxr',source_schema='modality')
+        self.run_etl('ecg_machine',source_schema='modality')
+        self.run_modality('ext_modality_note.sql')
+        self.assertEqual(self.sql("SELECT component_kind FROM note_audit.cxr_note_component WHERE study_id=502"),'REPORT')
+        self.assertEqual(self.sql("SELECT note_text FROM cdm.note WHERE note_source_value='CXR_VARIANT'"),value)
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note WHERE note_source_value IN ('CXR','CXR_VARIANT','CXR_SUPPLEMENT') AND note_datetime IS NOT NULL"),'0')
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.note_metadata WHERE source_table='cxr' AND charttime IS NULL"),'0')
+        self.assertEqual(self.sql("SELECT field_value FROM note_audit.note_detail WHERE field_name='duplicate_status'"),'UNRESOLVED_POSSIBLE_DUPLICATE')
+        # One-time correction of the former acquisition-time proxy is limited
+        # to note_datetime and remains idempotent after applying the new rule.
+        self.sql("UPDATE cdm.note SET note_datetime=note_date::timestamp WHERE note_source_value IN ('CXR','CXR_VARIANT')")
+        self.assertEqual(self.run_etl('cxr',source_schema='modality')['changed_note_rows'],2)
+        self.assertEqual(self.run_etl('cxr',source_schema='modality')['changed_note_rows'],0)
+
+    def test_final_convention_audit_detects_invalid_visit_patient(self):
+        self.modality_fixture()
+        self.sql('CREATE TABLE cdm.provider(provider_id bigint); CREATE TABLE cdm.visit_detail(visit_detail_id bigint,person_id bigint);')
+        self.run_modality('st_modality_note.sql')
+        self.run_etl('cxr',source_schema='modality')
+        self.run_etl('ecg_machine',source_schema='modality')
+        self.run_modality('ext_modality_note.sql')
+        result=self.run_modality('qa_note.sql')
+        self.assertIn('NOTE_CONVENTION_REPORT',result.stdout)
+        self.sql("UPDATE cdm.visit_occurrence SET person_id=-1099511627776 WHERE visit_source_value='101|201'")
+        rejected=self.run_modality('qa_note.sql',success=False)
+        self.assertIn('"status": "FAIL"',rejected.stdout)
+        report=json.loads(next(line.removeprefix('NOTE_CONVENTION_REPORT ') for line in rejected.stdout.splitlines()
+            if line.startswith('NOTE_CONVENTION_REPORT ')))
+        self.assertGreater(report['checks']['visit_fk_or_person'],0)
 
     def test_raw_fingerprint_encoding_matches_python(self):
         row = ['quotes " and \\', '한글\r\n  spaces', '']

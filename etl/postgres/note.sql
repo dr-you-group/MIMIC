@@ -66,6 +66,7 @@ INSERT INTO lk_note_type VALUES
     ('radiology', 'RR', '68604-8', 'Radiology report'),
     ('radiology', 'AR', '68604-8', 'Radiology report addendum'),
     ('cxr', 'CXR', '68604-8', 'Chest radiograph report'),
+    ('cxr', 'CXR_VARIANT', '68604-8', 'Chest radiograph source report (possible duplicate or variant)'),
     ('cxr', 'CXR_SUPPLEMENT', '68604-8', 'Chest radiograph supplementary report (preliminary/addendum)'),
     ('ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation');
 
@@ -312,7 +313,9 @@ WITH changed AS (
         src.note_id                             AS note_id,
         src.person_id                           AS person_id,
         CAST(src.charttime AS date)             AS note_date,
-        src.charttime                           AS note_datetime,
+        -- CXR supplies acquisition time, not document recording time.
+        CASE WHEN src.source_table = 'cxr' THEN CAST(NULL AS timestamp)
+             ELSE src.charttime END             AS note_datetime,
         32817                                   AS note_type_concept_id, -- EHR
         src.note_class_concept_id                AS note_class_concept_id,
         src.note_title                          AS note_title,
@@ -429,7 +432,8 @@ WHERE w.person_id IS NOT NULL AND (
         encode(sha256(convert_to(n.note_text, 'UTF8')), 'hex'),
         octet_length(convert_to(n.note_text, 'UTF8'))::bigint)
     IS DISTINCT FROM
-       (w.person_id, w.charttime::date, w.charttime, 32817,
+       (w.person_id, w.charttime::date,
+        CASE WHEN w.source_table = 'cxr' THEN CAST(NULL AS timestamp) ELSE w.charttime END, 32817,
         w.note_class_concept_id, w.note_title, 32678, 4180186, NULL::integer,
         w.visit_occurrence_id, NULL::bigint, w.note_type, w.text_sha256, w.text_bytes)
 );

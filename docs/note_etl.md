@@ -14,28 +14,34 @@ CXR and ECG machine sources use canonical SQL views and this same mapping.
 Echo supplies linkage metadata only. See [modality_notes.md](modality_notes.md)
 for adapters, duplicate rules, identity namespaces, quarantine, and execution order.
 
+The repository and the reviewed existing database use CDM v5.3.1's 14 NOTE
+fields. The shared fields also follow CDM v5.4 conventions, but this add-on
+does not migrate the Core schema or claim that a v5.3.1 instance is v5.4.
+The optional v5.4 event fields are outside this schema. CXR date imputation and
+ECG machine authorship/clock limitations are explicit in the modality contract.
+
 ## Mapping contract
 
 | NOTE field | Rule |
 | --- | --- |
 | `note_id` | Positive integer from the first 15 hexadecimal digits of SHA-256 of UTF-8 `mimic-iv-note\|<source_table>\|<source_note_id>` |
 | `person_id` | Existing `person_source_value = CAST(subject_id AS string)` mapping |
-| `note_date`, `note_datetime` | Date of `charttime`, and unchanged `charttime` |
+| `note_date`, `note_datetime` | Date of `charttime`, and unchanged `charttime`; CXR document time is unknown, so its `note_datetime` is NULL and its acquisition date is a documented date proxy |
 | `note_type_concept_id` | 32817, EHR |
 | `note_class_concept_id` | Resolve the source-type LOINC code in the installed Vocabulary |
-| `note_title` | Discharge summary / Radiology report, with an addendum suffix for AD / AR |
+| `note_title` | Source-specific document title; distinguishes addenda, CXR variants/supplements, and ECG machine interpretations |
 | `note_text` | Original text, without trimming, section extraction, or newline normalization |
 | `encoding_concept_id` | 32678, UTF-8 |
 | `language_concept_id` | 4180186, English |
 | `provider_id`, `visit_detail_id` | NULL |
 | `visit_occurrence_id` | Existing visit with the same person and `visit_source_value = subject_id\|hadm_id` |
-| `note_source_value` | Original DS, AD, RR, or AR |
+| `note_source_value` | DS, AD, RR, AR, or the canonical modality source type listed below |
 
 | Source | Types | LOINC document code |
 | --- | --- | --- |
 | discharge | DS, AD | 18842-5, Discharge summary |
 | radiology | RR, AR | 68604-8, Radiology Diagnostic Study Note |
-| cxr | CXR (confirmed new documents) | 68604-8, Radiology Diagnostic Study Note |
+| cxr | CXR, CXR_SUPPLEMENT, CXR_VARIANT (unresolved possible duplicate) | 68604-8, Radiology Diagnostic Study Note |
 | ecg_machine | ECG_MACHINE | 75425-9, Cardiology Diagnostic study note |
 
 Document concepts must be valid, standard LOINC concepts in the Note domain.
@@ -83,6 +89,13 @@ PostgreSQL audit tables live in the selected `etl_schema`:
 
 The corresponding BigQuery tables have the `ext_` prefix and remain in the
 ETL dataset. Retain that dataset when publishing the final CDM.
+
+When moving this add-on to another database, transfer its source detail tables
+and provenance along with NOTE. An earlier NOTE-only copy must be reconciled
+before rerunning: compare every existing NOTE field and raw source field,
+restore the verified source-ID map without changing NOTE IDs, then rerun the
+source-specific ETL to rebuild metadata/details. The unowned-ID collision
+guard deliberately rejects adoption without that reconciliation.
 
 ## SQL layout
 
@@ -212,11 +225,13 @@ use a fake `bq` executable to verify the combined script order, transaction
 boundaries, and error propagation.
 They do not constitute execution of the SQL on the BigQuery service.
 
-Availability and proposed mappings for CXR, ECG, and Echo are documented in
-[Modality notes](modality_notes.md). That assessment does not enable additional
-source types in the current discharge/radiology workflow.
+The same workflow accepts `cxr` and `ecg_machine` after their canonical views
+are prepared. Source-variant handling, supplement links, timestamp limitations,
+and unavailable Echo/physician ECG narratives are documented in
+[Modality notes](modality_notes.md).
 
-References: [OMOP NOTE](https://ohdsi.github.io/CommonDataModel/cdm54.html#note),
+References: [OMOP v5.3 NOTE](https://ohdsi.github.io/CommonDataModel/cdm53.html#note),
+[OMOP v5.4 NOTE](https://ohdsi.github.io/CommonDataModel/cdm54.html#note),
 [MIMIC-IV-Note](https://mimic.mit.edu/docs/iv/modules/note/),
 [LOINC 18842-5](https://loinc.org/18842-5/),
 [LOINC 68604-8](https://loinc.org/68604-8/).
