@@ -47,8 +47,8 @@ SELECT
     CASE
         WHEN per.person_id IS NULL THEN 'MISSING_PERSON'
         WHEN link.decision = 'MATCHED_RADIOLOGY' AND nt.note_id IS NOT NULL THEN 'LINKED_EXISTING'
-        WHEN link.decision = 'NEW_NO_PATIENT_RADIOLOGY' AND nt.note_id IS NOT NULL THEN 'LOADED'
-        WHEN link.decision IN ('MATCHED_RADIOLOGY', 'NEW_NO_PATIENT_RADIOLOGY') THEN 'ERROR_NOTE_NOT_LOADED'
+        WHEN link.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY') AND nt.note_id IS NOT NULL THEN 'LOADED'
+        WHEN link.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY') THEN 'ERROR_NOTE_NOT_LOADED'
         ELSE link.decision
     END                                         AS load_status,
     link.match_method                           AS match_method,
@@ -138,6 +138,8 @@ WHERE
 ;
 CREATE UNIQUE INDEX ON lk_modality_note_link(source_table, study_id);
 ANALYZE lk_modality_note_link;
+CREATE UNIQUE INDEX ON lk_modality_note_link(source_table, study_id);
+ANALYZE lk_modality_note_link;
 
 -- -------------------------------------------------------------------
 -- ext_modality_note_link
@@ -173,6 +175,73 @@ INSERT INTO modality_checks VALUES
     ));
 DELETE FROM :"etl_schema".modality_note_link WHERE source_table IN ('cxr', 'ecg_machine', 'echo');
 INSERT INTO :"etl_schema".modality_note_link SELECT * FROM lk_modality_note_link;
+
+-- -------------------------------------------------------------------
+-- lk_cxr_note_component
+-- One study may reference a final NOTE and a supplementary NOTE or AR.
+-- Offsets and hashes also preserve unmatched and missing-person text.
+-- -------------------------------------------------------------------
+
+CREATE TEMP TABLE lk_cxr_note_component ON COMMIT DROP AS
+SELECT
+    comp.subject_id, comp.study_id, comp.component_kind, comp.source_note_id,
+    comp.source_start, comp.source_length,
+    encode(sha256(convert_to(substr(raw.text, comp.source_start, comp.source_length), 'UTF8')), 'hex') AS text_sha256,
+    study.person_id,
+    nt.note_id,
+    CASE WHEN comp.component_kind = 'PREFIX' THEN study.note_id END AS parent_note_id,
+    comp.radiology_note_id AS external_note_id,
+    comp.decision, comp.match_method, comp.candidate_count,
+    CASE
+        WHEN study.person_id IS NULL THEN 'MISSING_PERSON'
+        WHEN comp.decision = 'MATCHED_RADIOLOGY' AND nt.note_id IS NOT NULL THEN 'LINKED_EXISTING'
+        WHEN comp.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+            AND nt.note_id IS NOT NULL THEN 'LOADED'
+        WHEN comp.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+            THEN 'ERROR_NOTE_NOT_LOADED'
+        ELSE comp.decision
+    END AS load_status,
+    study.source_datetime,
+    'STUDY_ACQUISITION_TIME_NOT_DOCUMENT_AVAILABILITY'::text AS timestamp_basis,
+    study.source_version, study.source_sha256, study.checksum_status
+FROM :"etl_schema".cxr_component comp
+INNER JOIN :"source_schema".cxr_reports raw ON CAST(raw.study_id AS integer) = comp.study_id
+INNER JOIN lk_modality_note_link study ON study.source_table = 'cxr' AND study.study_id = comp.study_id
+LEFT JOIN :"etl_schema".note_id_map map
+    ON map.source_table = CASE WHEN comp.decision = 'MATCHED_RADIOLOGY' THEN 'radiology' ELSE 'cxr' END
+    AND map.source_note_id = CASE WHEN comp.decision = 'MATCHED_RADIOLOGY' THEN comp.radiology_note_id ELSE comp.source_note_id END
+LEFT JOIN :"cdm_schema".note nt ON nt.note_id = map.note_id;
+CREATE UNIQUE INDEX ON lk_cxr_note_component(study_id, component_kind);
+ANALYZE lk_cxr_note_component;
+CREATE TABLE IF NOT EXISTS :"etl_schema".cxr_note_component (
+    subject_id integer NOT NULL, study_id integer NOT NULL, component_kind text NOT NULL,
+    source_note_id text NOT NULL, source_start integer NOT NULL, source_length integer NOT NULL,
+    text_sha256 text NOT NULL, person_id bigint, note_id bigint, parent_note_id bigint, external_note_id text,
+    decision text NOT NULL, match_method text, candidate_count bigint NOT NULL, load_status text NOT NULL,
+    source_datetime timestamp, timestamp_basis text NOT NULL,
+    source_version text NOT NULL, source_sha256 text NOT NULL, checksum_status text NOT NULL,
+    PRIMARY KEY (study_id, component_kind)
+);
+INSERT INTO modality_checks VALUES
+    ('all_eligible_components_loaded', NOT EXISTS (SELECT 1 FROM lk_cxr_note_component WHERE load_status = 'ERROR_NOTE_NOT_LOADED')),
+    ('same_person_component_links', NOT EXISTS (
+        SELECT 1 FROM lk_cxr_note_component c INNER JOIN :"cdm_schema".note n USING (note_id)
+        WHERE c.person_id IS DISTINCT FROM n.person_id
+    )),
+    ('loaded_component_text_unchanged', NOT EXISTS (
+        SELECT 1 FROM lk_cxr_note_component c INNER JOIN :"cdm_schema".note n USING (note_id)
+        WHERE c.load_status = 'LOADED' AND c.text_sha256 <> encode(sha256(convert_to(n.note_text, 'UTF8')), 'hex')
+    )),
+    ('stable_existing_component_links', NOT EXISTS (
+        SELECT 1 FROM :"etl_schema".cxr_note_component old LEFT JOIN lk_cxr_note_component new USING (study_id, component_kind)
+        WHERE old.note_id IS NOT NULL AND old.note_id IS DISTINCT FROM new.note_id
+    ));
+DELETE FROM :"etl_schema".cxr_note_component;
+INSERT INTO :"etl_schema".cxr_note_component SELECT * FROM lk_cxr_note_component;
+CREATE OR REPLACE VIEW :"etl_schema".cxr_component_text AS
+SELECT comp.*, substr(raw.text, comp.source_start, comp.source_length) AS source_text
+FROM :"etl_schema".cxr_note_component comp
+INNER JOIN :"source_schema".cxr_reports raw ON CAST(raw.study_id AS integer) = comp.study_id;
 INSERT INTO modality_checks VALUES
     ('all_link_fields_preserved', NOT EXISTS (
         (SELECT * FROM lk_modality_note_link EXCEPT ALL SELECT * FROM :"etl_schema".modality_note_link

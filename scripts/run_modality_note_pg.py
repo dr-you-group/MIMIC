@@ -85,10 +85,14 @@ def main(args):
     save(args.audit/'run.json',state)
     state['before']=fingerprint(args,'note_before');save(args.audit/'run.json',state)
     sources={r['table']:r for r in manifest['tables']}
-    phases=[('st_modality_note.sql',[]),
-        ('note.sql',['-v','source_table=cxr','-v','source_version=2.1.0','-v','source_sha256='+sources['cxr_reports']['source_sha256']]),
-        ('note.sql',['-v','source_table=ecg_machine','-v','source_version=1.0','-v','source_sha256='+sources['ecg_machine_measurements']['source_sha256']]),
-        ('ext_modality_note.sql',[])]
+    source_rules={'cxr':('2.1.0','cxr_reports'), 'ecg_machine':('1.0','ecg_machine_measurements')}
+    phases=[('st_modality_note.sql',[])]
+    for source in args.sources:
+        version,raw=source_rules[source]
+        phases.append(('note.sql',['-v','source_table='+source,'-v','source_version='+version,
+                                  '-v','source_sha256='+sources[raw]['source_sha256']]))
+    phases.append(('ext_modality_note.sql',[]))
+    state['sources']=args.sources
     for index,(file,variables) in enumerate(phases):
         if hashlib.sha256((ROOT/'etl/postgres'/file).read_bytes()).hexdigest()!=hashes[file]:
             raise ValueError('SQL changed during the run')
@@ -123,4 +127,6 @@ if __name__=='__main__':
     p.add_argument('--radiology-schema',default='mimiciv_note')
     p.add_argument('--cdm-schema',default='mimiciv')
     p.add_argument('--etl-schema',default='mimiciv_note_etl')
+    p.add_argument('--sources',nargs='+',choices=['cxr','ecg_machine'],default=['cxr','ecg_machine'],
+                   help='NOTE sources to load; omitted sources must already have completed their NOTE ETL')
     main(p.parse_args())

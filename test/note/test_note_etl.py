@@ -37,7 +37,7 @@ class PostgresNoteTests(unittest.TestCase):
         cls.addClassCleanup(lambda: subprocess.run(
             ["docker", "rm", "-f", cls.container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         for _ in range(60):
-            if subprocess.run(["docker", "exec", cls.container, "pg_isready", "-U", "postgres"],
+            if subprocess.run(["docker", "exec", cls.container, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 return
             time.sleep(0.5)
@@ -301,8 +301,86 @@ class PostgresNoteTests(unittest.TestCase):
             UPDATE modality.cxr_reports SET text='FINAL REPORT Different deidentification. {body}' WHERE study_id='501';""")
         self.run_modality('st_modality_note.sql')
         self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'CLINICAL_BODY_CHEST_WITHIN_1H')
-        self.sql("UPDATE modality.cxr_metadata SET studytime='020000' WHERE study_id='501'")
+        self.sql("UPDATE modality.cxr_metadata SET studytime='080000' WHERE study_id='501'")
         self.assertIn('stable_existing_resolution',self.run_modality('st_modality_note.sql',success=False).stderr)
+
+    def test_cxr_wet_read_is_preserved_separately_and_final_is_reused(self):
+        self.modality_fixture()
+        prefix = 'WET READ: preliminary 한글\n  No pleural effusion.\n____________________\n'
+        text = prefix + ' FINAL REPORT\nRadiology\nreport'
+        self.sql("UPDATE modality.cxr_reports SET text='" + text + "' WHERE study_id='501'")
+        self.run_modality('st_modality_note.sql')
+        self.run_etl('cxr',source_schema='modality')
+        self.run_etl('ecg_machine',source_schema='modality')
+        self.run_modality('ext_modality_note.sql')
+        expected_hash = hashlib.sha256(prefix.encode()).hexdigest()
+        self.assertEqual(self.sql("SELECT text_sha256 FROM note_audit.cxr_note_component WHERE study_id=501 AND component_kind='PREFIX'"),expected_hash)
+        self.assertEqual(self.sql("SELECT note_source_value FROM cdm.note WHERE note_title LIKE '%supplementary%'"),'CXR_SUPPLEMENT')
+        self.assertEqual(self.sql("SELECT parent_note_id FROM note_audit.cxr_note_component WHERE study_id=501 AND component_kind='PREFIX'"),str(note_id('radiology','101-RR-1')))
+        self.assertEqual(self.sql("SELECT source_text='" + prefix + "' FROM note_audit.cxr_component_text WHERE study_id=501 AND component_kind='PREFIX'"),'t')
+        self.assertEqual(self.sql("SELECT note_text FROM cdm.note WHERE note_id="+str(note_id('radiology','101-RR-1'))),'Radiology\nreport')
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.run_etl('cxr',source_schema='modality')['changed_note_rows'],0)
+        self.run_modality('ext_modality_note.sql')
+
+    def test_cxr_exact_parent_linked_addendum_reuses_both_notes(self):
+        self.modality_fixture()
+        text='FINAL ADDENDUM\nADDENDUM: Radiology addendum\n____________________\nFINAL REPORT\nRadiology\nreport'
+        self.sql("UPDATE modality.cxr_reports SET text='"+text+"' WHERE study_id='501'")
+        self.run_modality('st_modality_note.sql')
+        self.run_etl('cxr',source_schema='modality')
+        self.run_etl('ecg_machine',source_schema='modality')
+        self.run_modality('ext_modality_note.sql')
+        self.assertEqual(self.sql("SELECT note_id FROM note_audit.cxr_note_component WHERE study_id=501 AND component_kind='PREFIX'"),str(note_id('radiology','101-AR-1')))
+        self.assertEqual(self.sql("SELECT count(*) FROM cdm.note WHERE note_source_value='CXR_SUPPLEMENT'"),'0')
+        self.assertEqual(self.sql("SELECT count(*) FROM note_audit.cxr_note_component WHERE study_id=501 AND load_status='LINKED_EXISTING'"),'2')
+
+    def test_cxr_midnight_images_match_one_final_report(self):
+        self.modality_fixture()
+        body='FINDINGS: No acute pulmonary changes; the cardiomediastinal silhouette remains normal.'
+        self.sql(f"""UPDATE raw.radiology SET text='Indication. {body}',charttime='2100-01-02 00:06:00' WHERE note_id='101-RR-1';
+            UPDATE raw.radiology_detail SET field_value='CHEST (PA AND LAT)' WHERE field_name='exam_name';
+            UPDATE modality.cxr_reports SET text='FINAL REPORT Different indication. {body}' WHERE study_id='501';
+            UPDATE modality.cxr_metadata SET studytime='235600.000000004' WHERE study_id='501';
+            INSERT INTO modality.cxr_metadata VALUES ('101','501','21000102','001400.125000004');""")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),'MATCHED_RADIOLOGY')
+        self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'FINAL_BODY_CHEST_WITHIN_6H')
+
+    def test_cxr_legacy_link_survives_a_late_image_in_the_same_study(self):
+        self.modality_fixture()
+        self.sql("INSERT INTO modality.cxr_metadata VALUES ('101','501','21000101','120000')")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),'MATCHED_RADIOLOGY')
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT radiology_note_id FROM note_audit.cxr_reconciliation WHERE study_id=501"),'101-RR-1')
+
+    def test_cxr_mask_rule_keeps_negation_numbers_and_punctuation(self):
+        body='FINDINGS: No pleural effusion. Cardiac size is normal. A 3.1 cm opacity in the left lung is unchanged.'
+        cases=[(body.replace('effusion.','effusion. ___'),'MATCHED_RADIOLOGY'),
+               (body.replace('No pleural','___ pleural'),'REVIEW_OVERLAP'),
+               (body.replace('3.1','3.___1'),'REVIEW_OVERLAP'),
+               (body.replace('3.1','3.2'),'REVIEW_OVERLAP')]
+        for variant,expected in cases:
+            with self.subTest(expected=expected,variant=variant):
+                self.setUp()
+                self.modality_fixture()
+                self.sql(f"""UPDATE raw.radiology SET text='Indication. {body}' WHERE note_id='101-RR-1';
+                    UPDATE raw.radiology_detail SET field_value='CHEST (PA AND LAT)' WHERE field_name='exam_name';
+                    UPDATE modality.cxr_reports SET text='Different indication. {variant}' WHERE study_id='501';""")
+                self.run_modality('st_modality_note.sql')
+                self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),expected)
+                if expected=='MATCHED_RADIOLOGY':
+                    self.assertEqual(self.sql("SELECT match_method FROM note_audit.cxr_reconciliation WHERE study_id=501"),'MASK_ONLY_BODY_CHEST_WITHIN_1H')
+
+    def test_cxr_new_report_requires_temporal_and_text_exclusion(self):
+        self.modality_fixture()
+        self.sql("""UPDATE modality.cxr_reports SET text='Distinct report with a newly described finding.' WHERE study_id='501';
+            UPDATE modality.cxr_reports SET text=E'Radiology\\nreport' WHERE study_id='502';
+            UPDATE modality.cxr_metadata SET studydate='21000201' WHERE study_id IN ('501','502');""")
+        self.run_modality('st_modality_note.sql')
+        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=501"),'NEW_NO_NEARBY_RADIOLOGY')
+        self.assertEqual(self.sql("SELECT decision FROM note_audit.cxr_reconciliation WHERE study_id=502"),'REVIEW_OVERLAP')
 
     def test_zero_new_cxr_documents_is_valid(self):
         self.modality_fixture()

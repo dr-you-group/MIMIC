@@ -7,7 +7,7 @@ these queries directly against the existing CDM. Existing Core IDs are retained.
 
 | Source | Implemented action | NOTE source / LOINC |
 | --- | --- | --- |
-| CXR 2.1.0 | Reuse resolved radiology documents; add reports from subjects with no raw radiology; retain other cases for review | CXR / 68604-8 |
+| CXR 2.1.0 | Reuse resolved radiology documents and add non-overlapping reports and supplementary source text | CXR, CXR_SUPPLEMENT / 68604-8 |
 | ECG 1.0 | Construct machine interpretation documents from 18 original report fields | ECG_MACHINE / 75425-9 |
 | Echo 1.0.1 | Preserve study/report linkage and validation status; no NOTE without narrative | NO_REPORT_BODY |
 
@@ -33,31 +33,96 @@ using its linkage as validated data.
 ## CXR rules
 
 A study may have several images; do not create one NOTE per image. `study_id`
-is not `hadm_id`. The earliest image-metadata study time is an acquisition
-time, not a report signing time. Multiple study dates require review.
+is not `hadm_id`. New CXR notes use the earliest image acquisition time as an
+explicit proxy. It is **not the authoring, signing, or availability time** of a
+final, preliminary, or supplementary report. `storetime` stays NULL. Do not use
+this proxy alone to determine whether a document was available for prediction.
 
-Candidates must have the same patient and calendar date:
+### Match the final report
 
-- `FULL_TEXT_SAME_DAY`: complete text matches after whitespace normalization
-  and removal of a leading `FINAL REPORT` label.
-- `CLINICAL_BODY_CHEST_WITHIN_1H`: normalized FINDINGS/IMPRESSION-to-end text
-  matches exactly, is at least 40 characters, the raw exam is a chest radiograph,
-  and acquisition/chart times differ by at most one hour. CXR addendum,
-  amended-report, and long underscore separator markers exclude this route.
-  It addresses header/deidentification differences and is recorded separately.
-- Both study and radiology document must have exactly one candidate. Repeated
-  generic reports and ambiguous pairs remain in review.
+All candidates require the same patient. Existing unambiguous legacy matches
+are evaluated first and retain their NOTE IDs, including their original time
+rule. Newly resolved studies must have complete image times spanning at most
+six hours. A study can cross midnight; every image time is considered.
 
-These are deterministic matching rules, not clinical adjudication. Comparison
-normalization never changes stored text. `cxr_reconciliation` records method,
-count, and decision. Resolved reports reuse the existing radiology NOTE and
-its person, visit, document time, and text. `modality_note_link` stores the
-study alias without creating a second owner in the unique NOTE ID map.
+| Priority | Matching rule for previously unresolved studies |
+| --- | --- |
+| 1 | Entire normalized source report matches within six hours of an image |
+| 2 | Final report after the last standalone `FINAL REPORT` line matches within six hours |
+| 3 | FINDINGS/IMPRESSION-to-end matches exactly, has at least 40 characters, and the target is a chest radiograph within six hours |
+| 4 | Body of at least 80 characters differs only in standalone `___` mask runs and resulting whitespace, with a chest radiograph within one hour |
 
-The default new-document rule is narrow: `NEW_NO_PATIENT_RADIOLOGY` requires
-no raw radiology document at all for that subject. Other unmatched documents,
-including unresolved addenda, are `REVIEW_OVERLAP`. A missing hash match is
-not proof of novelty. Complete originals remain available for reconciliation.
+The fourth rule never removes or replaces words, numbers, or punctuation.
+Masks touching letters or numbers are ineligible. For example, `No effusion`
+and `___ effusion`, or `3.1 cm` and `3.2 cm`, do **not** match. Neither fuzzy
+similarity nor an inferred reconstruction of masked text is an identity rule.
+
+Select the best available priority for each study, then require uniqueness in
+both directions across those candidates. Already resolved legacy reports cannot
+be claimed by a new study. Ambiguous or time-distant matches remain reviewable.
+`cxr_reconciliation` records the method, count, and decision. Existing NOTE text,
+patient, visit, and document time stay unchanged. Original CXR text is retained
+even when its header or masks differ from the linked radiology document.
+
+### Preserve preliminary reports and addenda
+
+A CXR file can contain `WET READ`, provisional findings, addenda, and their
+versions before its final report. When the final report has a resolved RR link,
+partition the original at the last standalone `FINAL REPORT` heading:
+
+- `FINAL` includes that heading and the rest of the report, and reuses the RR.
+- `PREFIX` retains every preceding character, including original headers,
+  line breaks, separator lines, timestamps and version markers.
+- If the entire normalized prefix is an exact existing AR linked to that RR
+  through `parent_note_id`/`addendum_note_id`, reuse the AR as well. Only wrapper
+  headings and standalone separator lines are removed for that comparison.
+- Otherwise load the prefix unchanged as `CXR_SUPPLEMENT`, with a title that
+  explicitly identifies supplementary preliminary/addendum text. Its source ID
+  is `<subject_id>-CXR-<study_id>-PREFIX`. It is a source document component,
+  not an assertion of a new clinical event or a final physician diagnosis.
+
+A prefix can contain multiple versions; they are preserved together. Do not
+invent signing times or a sequence of newly dated clinical events. A prefix
+that differs from an existing AR remains a separately identified source
+variant, not a silent replacement of that AR.
+
+For an eligible new CXR report, preserve the **whole original file** as one
+`REPORT`, including any prefix. Unresolved bundles are likewise retained whole
+in the extension; their uncertain final report is not automatically inserted.
+
+### Admit additional source reports
+
+`NEW_NO_PATIENT_RADIOLOGY` retains the original no-radiology-for-patient rule.
+`NEW_NO_NEARBY_RADIOLOGY` also admits an unmatched report if:
+
+1. Every image timestamp is available and the image span is at most six hours.
+2. No raw RR or AR for that patient falls between seven days before the first
+   image and seven days after the last image.
+3. No full-text, final-text, body, or mask-only-body match exists anywhere in
+   that patient's radiology history, including outside the time window.
+
+This is a reproducible source-coverage rule, not proof that no corresponding
+clinical document exists elsewhere. The wider exclusion window reduces
+insertion of delayed versions of existing reports. Mere lack of an exact hash
+match does not qualify a report that overlaps an existing episode.
+
+### Account for every character and link
+
+`cxr_component` stores character offsets, component kind, and decisions.
+Concatenating all components in source order must reproduce every original CXR
+file exactly; staging fails if any character is missing or duplicated.
+`cxr_note_component` adds component hashes, person/NOTE IDs, the final parent
+NOTE for a prefix, external RR/AR ID, time basis, and source checksums. The view
+`cxr_component_text` exposes the original component text, including unresolved
+and missing-person cases, without duplicating the entire raw text in storage.
+BigQuery uses the same names with the `ext_` prefix.
+
+`modality_note_link` remains one row per study and points to the principal
+report. Join `cxr_note_component` by `study_id` to retrieve supplements; counting
+only the principal study link omits those additional notes. Missing CDM persons
+remain in raw/extension records. Established NOTE and component IDs cannot be
+silently changed or removed. The common NOTE ETL checks the complete text hash
+and all mapped fields of every new source component.
 
 ## ECG and Echo rules
 
@@ -92,7 +157,8 @@ The positive 60-bit SHA-256 prefix uses these UTF-8 inputs:
 | Source | Stable identity input |
 | --- | --- |
 | discharge/radiology, unchanged | `mimic-iv-note\|<source_table>\|<source_note_id>` |
-| New CXR | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>` |
+| New whole CXR | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>` |
+| CXR supplement | `mimic-cxr\|cxr\|<subject_id>-CXR-<study_id>-PREFIX` |
 | ECG machine | `mimic-iv-ecg\|ecg_machine\|<subject_id>-ECG_MACHINE-<study_id>` |
 
 Version/checksum are provenance, not identity. No new NOTE ID is allocated
@@ -123,7 +189,9 @@ transaction and can be resumed. Changed established resolutions require
 explicit reconciliation. Source notes are not silently deleted; zero new CXR
 notes is valid. The runner records SQL hashes and checks all 14 mapped fields
 of every pre-existing NOTE before and after. Compare final NOTE fingerprints
-and modality links between databases running the same revision.
+and modality/component links between databases running the same revision.
+Use `--sources cxr` to update only CXR after ECG has already been loaded;
+the existing ECG and Echo linkage is still verified.
 
 ## BigQuery
 
@@ -153,7 +221,8 @@ Persistent extensions have the `ext_` prefix. The 14 NOTE field rules still use
 
 `python -m unittest discover -s test/note -v` runs isolated PostgreSQL integration
 and BigQuery runner/rendering tests, covering existing-note preservation, stable
-IDs, CXR ambiguity/body matching, machine line positions, missing persons, Echo
+IDs, CXR ambiguity/body/mask matching, midnight boundaries, prefix reconstruction,
+existing AR reuse, negation/numeric differences, machine line positions, missing persons, Echo
 quarantine, empty CXR output, rollback, and idempotence. Rendering and parsing
 are not execution on the BigQuery service.
 

@@ -54,6 +54,18 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT pg_temp.note_normalize(substring(value FROM
         '(?is)((?:FINDINGS(?: AND IMPRESSION)?|IMPRESSION):.*)'))
 $$;
+CREATE FUNCTION pg_temp.note_mask(value text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE WHEN value ~ '[[:alnum:]]_{3,}|_{3,}[[:alnum:]]' THEN NULL
+        ELSE pg_temp.note_normalize(regexp_replace(value, '_{3,}', '', 'g')) END
+$$;
+CREATE FUNCTION pg_temp.note_addendum(value text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT pg_temp.note_normalize(regexp_replace(regexp_replace(regexp_replace(
+        value, '(?n)^[ \t]*_{10,}[ \t]*\r?$', '', 'g'),
+        '(?is)^[[:space:]]*FINAL ADDENDUM[[:space:]]*', ''),
+        '(?is)^[[:space:]]*ADDENDUM[[:space:]]*:?[[:space:]]*', ''))
+$$;
 
 -- -------------------------------------------------------------------
 -- src_cxr_study
@@ -75,27 +87,59 @@ SELECT
 FROM
     :"source_schema".cxr_metadata
 ;
-CREATE TEMP TABLE src_cxr_study ON COMMIT DROP AS
+CREATE INDEX ON src_cxr_time(study_id);
+CREATE TEMP TABLE src_cxr_text ON COMMIT DROP AS
 SELECT
-    CAST(raw.subject_id AS integer)             AS subject_id,
-    CAST(raw.study_id AS integer)               AS study_id,
-    raw.subject_id || '-CXR-' || raw.study_id    AS source_note_id,
+    raw.*,
+    coalesce(substring(raw.text FROM '(?s)^(.*\n)[ \t]*FINAL REPORT[ \t]*\r?\n'), '') AS prefix_text
+FROM :"source_schema".cxr_reports raw;
+CREATE TEMP TABLE src_cxr_study ON COMMIT DROP AS
+WITH normalized AS MATERIALIZED (
+    SELECT
+        CAST(raw.subject_id AS integer) AS subject_id,
+        CAST(raw.study_id AS integer) AS study_id,
+        raw.subject_id || '-CXR-' || raw.study_id AS source_note_id,
+        length(raw.text) AS text_length,
+        CASE WHEN pg_temp.note_normalize(raw.prefix_text) <> '' THEN length(raw.prefix_text) ELSE 0 END AS prefix_length,
+        pg_temp.note_normalize(raw.text) AS full_text,
+        pg_temp.note_normalize(substr(raw.text, length(raw.prefix_text) + 1)) AS final_text,
+        pg_temp.note_body(raw.text) AS original_body,
+        pg_temp.note_body(substr(raw.text, length(raw.prefix_text) + 1)) AS final_body,
+        pg_temp.note_addendum(raw.prefix_text) AS prefix_addendum,
+        raw.text ~* 'addendum|amended report|_{10}' AS has_addendum
+    FROM src_cxr_text raw
+)
+SELECT
+    raw.subject_id                              AS subject_id,
+    raw.study_id                                AS study_id,
+    raw.source_note_id                          AS source_note_id,
     tm.study_datetime                           AS study_datetime,
     tm.study_dates                              AS study_dates,
-    encode(sha256(convert_to(pg_temp.note_normalize(raw.text), 'UTF8')), 'hex') AS full_hash,
-    CASE WHEN length(pg_temp.note_body(raw.text)) >= 40 THEN
-        encode(sha256(convert_to(pg_temp.note_body(raw.text), 'UTF8')), 'hex')
+    tm.study_end                                AS study_end,
+    tm.missing_times                            AS missing_times,
+    raw.text_length                             AS text_length,
+    raw.prefix_length                           AS prefix_length,
+    encode(sha256(convert_to(raw.final_text, 'UTF8')), 'hex') AS final_hash,
+    CASE WHEN length(raw.final_body) >= 40 THEN
+        encode(sha256(convert_to(raw.final_body, 'UTF8')), 'hex')
+    END                                         AS final_body_hash,
+    CASE WHEN length(pg_temp.note_mask(raw.final_body)) >= 80 THEN
+        encode(sha256(convert_to(pg_temp.note_mask(raw.final_body), 'UTF8')), 'hex')
+    END                                         AS mask_body_hash,
+    encode(sha256(convert_to(raw.prefix_addendum, 'UTF8')), 'hex') AS prefix_addendum_hash,
+    encode(sha256(convert_to(raw.full_text, 'UTF8')), 'hex') AS full_hash,
+    CASE WHEN length(raw.original_body) >= 40 THEN
+        encode(sha256(convert_to(raw.original_body, 'UTF8')), 'hex')
     END                                         AS body_hash,
-    raw.text ~* 'addendum|amended report|_{10}'    AS has_addendum
-FROM
-    :"source_schema".cxr_reports raw
+    raw.has_addendum                            AS has_addendum
+FROM normalized raw
 LEFT JOIN (
     SELECT subject_id, study_id, min(study_datetime) AS study_datetime,
-        count(DISTINCT study_datetime::date) AS study_dates
+        count(DISTINCT study_datetime::date) AS study_dates,
+        max(study_datetime) AS study_end,
+        count(*) - count(study_datetime) AS missing_times
     FROM src_cxr_time GROUP BY subject_id, study_id
-) tm
-    ON tm.subject_id = CAST(raw.subject_id AS integer)
-   AND tm.study_id = CAST(raw.study_id AS integer)
+) tm ON tm.subject_id = raw.subject_id AND tm.study_id = raw.study_id
 ;
 CREATE UNIQUE INDEX ON src_cxr_study(study_id);
 CREATE INDEX ON src_cxr_study(subject_id);
@@ -116,25 +160,41 @@ WHERE field_name = 'exam_name'
 ;
 CREATE UNIQUE INDEX ON src_cxr_exam(note_id);
 CREATE TEMP TABLE src_cxr_radiology ON COMMIT DROP AS
+WITH normalized AS MATERIALIZED (
+    SELECT
+        raw.note_id AS source_note_id,
+        raw.subject_id,
+        raw.charttime,
+        raw.note_type,
+        pg_temp.note_normalize(raw.text) AS full_text,
+        pg_temp.note_body(raw.text) AS clinical_body,
+        CASE WHEN raw.note_type = 'AR' THEN pg_temp.note_addendum(raw.text) END AS addendum_text
+    FROM :"radiology_schema".radiology raw
+    WHERE EXISTS (SELECT 1 FROM src_cxr_study cxr WHERE cxr.subject_id = raw.subject_id)
+)
 SELECT
-    raw.note_id                                 AS source_note_id,
+    raw.source_note_id                          AS source_note_id,
     raw.subject_id                              AS subject_id,
     raw.charttime                               AS charttime,
     raw.note_type                               AS note_type,
-    encode(sha256(convert_to(pg_temp.note_normalize(raw.text), 'UTF8')), 'hex') AS full_hash,
-    CASE WHEN length(pg_temp.note_body(raw.text)) >= 40 THEN
-        encode(sha256(convert_to(pg_temp.note_body(raw.text), 'UTF8')), 'hex')
+    encode(sha256(convert_to(raw.full_text, 'UTF8')), 'hex') AS full_hash,
+    CASE WHEN length(raw.clinical_body) >= 40 THEN
+        encode(sha256(convert_to(raw.clinical_body, 'UTF8')), 'hex')
     END                                         AS body_hash,
+    CASE WHEN length(pg_temp.note_mask(raw.clinical_body)) >= 80 THEN
+        encode(sha256(convert_to(pg_temp.note_mask(raw.clinical_body), 'UTF8')), 'hex')
+    END                                         AS mask_body_hash,
+    encode(sha256(convert_to(raw.addendum_text, 'UTF8')), 'hex') AS addendum_hash,
     exam.note_id IS NOT NULL                    AS chest_exam
-FROM
-    :"radiology_schema".radiology raw
-LEFT JOIN
-    src_cxr_exam exam ON exam.note_id = raw.note_id
-WHERE
-    EXISTS (SELECT 1 FROM src_cxr_study cxr WHERE cxr.subject_id = raw.subject_id)
+FROM normalized raw
+LEFT JOIN src_cxr_exam exam ON exam.note_id = raw.source_note_id
 ;
 CREATE INDEX ON src_cxr_radiology(subject_id, (charttime::date));
 CREATE INDEX ON src_cxr_radiology(subject_id, full_hash);
+CREATE INDEX ON src_cxr_radiology(subject_id, charttime);
+CREATE INDEX ON src_cxr_radiology(subject_id, body_hash);
+CREATE INDEX ON src_cxr_radiology(subject_id, mask_body_hash);
+CREATE UNIQUE INDEX ON src_cxr_radiology(source_note_id);
 ANALYZE src_cxr_radiology;
 
 -- -------------------------------------------------------------------
@@ -170,6 +230,86 @@ INNER JOIN
 CREATE INDEX ON lk_cxr_candidate(study_id);
 ANALYZE lk_cxr_candidate;
 
+-- -------------------------------------------------------------------
+-- lk_cxr_extended_candidate
+-- Keep legacy matches first. New matches cross midnight and use every
+-- image time. Mask comparison removes underscores only, never words,
+-- numbers or punctuation. Fuzzy similarity is not an identity rule.
+-- -------------------------------------------------------------------
+
+CREATE TEMP TABLE lk_cxr_legacy_match ON COMMIT DROP AS
+SELECT * FROM lk_cxr_candidate WHERE study_candidates = 1 AND report_candidates = 1;
+CREATE UNIQUE INDEX ON lk_cxr_legacy_match(study_id);
+CREATE UNIQUE INDEX ON lk_cxr_legacy_match(radiology_note_id);
+CREATE TEMP TABLE lk_cxr_extended_pair ON COMMIT DROP AS
+SELECT
+    cxr.study_id                                AS study_id,
+    rad.source_note_id                          AS radiology_note_id,
+    CASE
+        WHEN cxr.full_hash = rad.full_hash THEN 1
+        WHEN cxr.final_hash = rad.full_hash THEN 2
+        WHEN cxr.final_body_hash = rad.body_hash THEN 3
+        ELSE 4
+    END                                         AS match_priority,
+    CASE
+        WHEN cxr.full_hash = rad.full_hash THEN 'FULL_TEXT_WITHIN_6H'
+        WHEN cxr.final_hash = rad.full_hash THEN 'FINAL_TEXT_WITHIN_6H'
+        WHEN cxr.final_body_hash = rad.body_hash THEN 'FINAL_BODY_CHEST_WITHIN_6H'
+        ELSE 'MASK_ONLY_BODY_CHEST_WITHIN_1H'
+    END                                         AS match_method
+FROM src_cxr_study cxr
+INNER JOIN src_cxr_radiology rad
+    ON rad.subject_id = cxr.subject_id AND rad.note_type = 'RR'
+    AND rad.charttime BETWEEN cxr.study_datetime - interval '6 hours' AND cxr.study_end + interval '6 hours'
+    AND (cxr.full_hash = rad.full_hash OR cxr.final_hash = rad.full_hash
+         OR (rad.chest_exam AND cxr.final_body_hash = rad.body_hash)
+         OR (rad.chest_exam AND cxr.mask_body_hash = rad.mask_body_hash))
+WHERE cxr.missing_times = 0 AND cxr.study_end - cxr.study_datetime <= interval '6 hours'
+    AND NOT EXISTS (SELECT 1 FROM lk_cxr_legacy_match old WHERE old.study_id = cxr.study_id)
+    AND NOT EXISTS (SELECT 1 FROM lk_cxr_legacy_match old WHERE old.radiology_note_id = rad.source_note_id)
+    AND EXISTS (
+        SELECT 1 FROM src_cxr_time tm WHERE tm.study_id = cxr.study_id
+          AND abs(extract(epoch FROM rad.charttime - tm.study_datetime)) <=
+              CASE WHEN cxr.full_hash = rad.full_hash OR cxr.final_hash = rad.full_hash
+                        OR (rad.chest_exam AND cxr.final_body_hash = rad.body_hash) THEN 21600 ELSE 3600 END
+    )
+;
+CREATE TEMP TABLE lk_cxr_extended_candidate ON COMMIT DROP AS
+SELECT
+    pair.*,
+    count(*) OVER (PARTITION BY pair.study_id) AS study_candidates,
+    count(*) OVER (PARTITION BY pair.radiology_note_id) AS report_candidates
+FROM lk_cxr_extended_pair pair
+INNER JOIN (
+    SELECT study_id, min(match_priority) AS match_priority FROM lk_cxr_extended_pair GROUP BY study_id
+) best USING (study_id, match_priority);
+CREATE INDEX ON lk_cxr_extended_candidate(study_id);
+CREATE TEMP TABLE lk_cxr_match ON COMMIT DROP AS
+SELECT study_id, radiology_note_id, match_method FROM lk_cxr_legacy_match
+UNION ALL
+SELECT study_id, radiology_note_id, match_method FROM lk_cxr_extended_candidate
+WHERE study_candidates = 1 AND report_candidates = 1;
+CREATE UNIQUE INDEX ON lk_cxr_match(study_id);
+CREATE UNIQUE INDEX ON lk_cxr_match(radiology_note_id);
+
+-- Absence of a nearby report alone is insufficient: a known exact full,
+-- final, clinical-body or mask-only match anywhere in the patient blocks
+-- insertion. Seven days is deliberately wider than the matching window.
+CREATE TEMP TABLE lk_cxr_novel ON COMMIT DROP AS
+SELECT cxr.study_id
+FROM src_cxr_study cxr
+WHERE NOT EXISTS (SELECT 1 FROM lk_cxr_match m WHERE m.study_id = cxr.study_id)
+  AND NOT EXISTS (
+      SELECT 1 FROM src_cxr_radiology r WHERE r.subject_id = cxr.subject_id
+        AND r.charttime BETWEEN cxr.study_datetime - interval '7 days' AND cxr.study_end + interval '7 days'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM src_cxr_radiology r WHERE r.subject_id = cxr.subject_id
+        AND (r.full_hash IN (cxr.full_hash, cxr.final_hash)
+             OR r.body_hash = cxr.final_body_hash OR r.mask_body_hash = cxr.mask_body_hash)
+  );
+CREATE UNIQUE INDEX ON lk_cxr_novel(study_id);
+
 CREATE TABLE IF NOT EXISTS :"etl_schema".cxr_reconciliation (
     subject_id integer NOT NULL, study_id integer PRIMARY KEY,
     source_note_id text NOT NULL, study_datetime timestamp,
@@ -183,33 +323,127 @@ SELECT
     cxr.source_note_id                          AS source_note_id,
     cxr.study_datetime                          AS study_datetime,
     CASE
-        WHEN cxr.study_datetime IS NULL OR cxr.study_dates <> 1 THEN 'REVIEW_STUDY_TIME'
+        WHEN legacy.study_id IS NOT NULL THEN 'MATCHED_RADIOLOGY'
+        WHEN cxr.study_datetime IS NULL OR cxr.missing_times <> 0
+             OR cxr.study_end - cxr.study_datetime > interval '6 hours' THEN 'REVIEW_STUDY_TIME'
         WHEN match.radiology_note_id IS NOT NULL THEN 'MATCHED_RADIOLOGY'
         WHEN NOT EXISTS (SELECT 1 FROM src_cxr_radiology r WHERE r.subject_id = cxr.subject_id)
             THEN 'NEW_NO_PATIENT_RADIOLOGY'
+        WHEN novel.study_id IS NOT NULL THEN 'NEW_NO_NEARBY_RADIOLOGY'
         ELSE 'REVIEW_OVERLAP'
     END                                         AS decision,
     match.radiology_note_id                      AS radiology_note_id,
     match.match_method                          AS match_method,
-    (SELECT count(*) FROM lk_cxr_candidate c WHERE c.study_id = cxr.study_id) AS candidate_count
+    CASE WHEN legacy.study_id IS NOT NULL THEN 1 ELSE
+        (SELECT count(*) FROM lk_cxr_extended_candidate c WHERE c.study_id = cxr.study_id)
+    END                                         AS candidate_count
 FROM
     src_cxr_study cxr
 LEFT JOIN
-    lk_cxr_candidate match
-        ON match.study_id = cxr.study_id
-        AND match.study_candidates = 1 AND match.report_candidates = 1
+    lk_cxr_match match ON match.study_id = cxr.study_id
+LEFT JOIN lk_cxr_legacy_match legacy ON legacy.study_id = cxr.study_id
+LEFT JOIN lk_cxr_novel novel ON novel.study_id = cxr.study_id
 ;
+CREATE UNIQUE INDEX ON lk_cxr_resolution(study_id);
+ANALYZE lk_cxr_resolution;
 INSERT INTO modality_checks VALUES
     ('reconciliation_no_fanout', (SELECT count(*) FROM lk_cxr_resolution) = (SELECT count(*) FROM src_cxr_study)),
     ('stable_existing_resolution', NOT EXISTS (
         SELECT 1 FROM :"etl_schema".cxr_reconciliation old
         LEFT JOIN lk_cxr_resolution new USING (study_id)
-        WHERE old.decision IN ('MATCHED_RADIOLOGY', 'NEW_NO_PATIENT_RADIOLOGY')
+        WHERE old.decision IN ('MATCHED_RADIOLOGY', 'NEW_NO_PATIENT_RADIOLOGY', 'NEW_NO_NEARBY_RADIOLOGY')
           AND (new.study_id IS NULL OR (old.decision, old.radiology_note_id)
               IS DISTINCT FROM (new.decision, new.radiology_note_id))
     ));
 DELETE FROM :"etl_schema".cxr_reconciliation;
 INSERT INTO :"etl_schema".cxr_reconciliation SELECT * FROM lk_cxr_resolution;
+
+-- -------------------------------------------------------------------
+-- lk_cxr_component
+-- A matched final report can have an additional source prefix containing
+-- wet reads, addenda and versions. Keep the prefix byte-for-byte, or reuse
+-- an exact existing AR explicitly linked to the same parent RR.
+-- -------------------------------------------------------------------
+
+CREATE TEMP TABLE src_cxr_parent ON COMMIT DROP AS
+SELECT DISTINCT note_id AS parent_note_id, field_value AS addendum_note_id
+FROM :"radiology_schema".radiology_detail WHERE field_name = 'addendum_note_id'
+UNION
+SELECT DISTINCT field_value AS parent_note_id, note_id AS addendum_note_id
+FROM :"radiology_schema".radiology_detail WHERE field_name = 'parent_note_id';
+CREATE INDEX ON src_cxr_parent(parent_note_id);
+CREATE TEMP TABLE lk_cxr_split ON COMMIT DROP AS
+SELECT cxr.study_id, cxr.prefix_length
+FROM src_cxr_study cxr
+INNER JOIN lk_cxr_resolution res USING (study_id)
+INNER JOIN src_cxr_radiology rad ON rad.source_note_id = res.radiology_note_id
+WHERE res.decision = 'MATCHED_RADIOLOGY' AND cxr.prefix_length > 0 AND cxr.full_hash <> rad.full_hash;
+CREATE UNIQUE INDEX ON lk_cxr_split(study_id);
+CREATE TEMP TABLE lk_cxr_addendum_candidate ON COMMIT DROP AS
+SELECT
+    cxr.study_id, ar.source_note_id AS radiology_note_id,
+    count(*) OVER (PARTITION BY cxr.study_id) AS study_candidates,
+    count(*) OVER (PARTITION BY ar.source_note_id) AS report_candidates
+FROM src_cxr_study cxr
+INNER JOIN lk_cxr_split split USING (study_id)
+INNER JOIN lk_cxr_resolution res USING (study_id)
+INNER JOIN src_cxr_parent parent ON parent.parent_note_id = res.radiology_note_id
+INNER JOIN src_cxr_radiology ar ON ar.source_note_id = parent.addendum_note_id
+    AND ar.subject_id = cxr.subject_id AND ar.note_type = 'AR'
+    AND ar.addendum_hash = cxr.prefix_addendum_hash;
+CREATE TEMP TABLE lk_cxr_component ON COMMIT DROP AS
+SELECT
+    cxr.subject_id, cxr.study_id,
+    CASE WHEN split.study_id IS NULL THEN 'REPORT' ELSE 'FINAL' END AS component_kind,
+    cxr.source_note_id,
+    coalesce(split.prefix_length, 0) + 1 AS source_start,
+    cxr.text_length - coalesce(split.prefix_length, 0) AS source_length,
+    res.decision, res.radiology_note_id, res.match_method, res.candidate_count
+FROM src_cxr_study cxr
+INNER JOIN lk_cxr_resolution res USING (study_id)
+LEFT JOIN lk_cxr_split split USING (study_id)
+UNION ALL
+SELECT
+    cxr.subject_id, cxr.study_id, 'PREFIX', cxr.source_note_id || '-PREFIX',
+    1, split.prefix_length,
+    CASE WHEN ar.radiology_note_id IS NULL THEN 'NEW_SUPPLEMENT' ELSE 'MATCHED_RADIOLOGY' END,
+    ar.radiology_note_id,
+    CASE WHEN ar.radiology_note_id IS NULL THEN 'PRESERVED_SOURCE_PREFIX' ELSE 'EXACT_PARENT_LINKED_ADDENDUM' END,
+    (SELECT count(*) FROM lk_cxr_addendum_candidate c WHERE c.study_id = cxr.study_id)
+FROM src_cxr_study cxr
+INNER JOIN lk_cxr_split split USING (study_id)
+LEFT JOIN lk_cxr_addendum_candidate ar ON ar.study_id = cxr.study_id
+    AND ar.study_candidates = 1 AND ar.report_candidates = 1;
+CREATE UNIQUE INDEX ON lk_cxr_component(study_id, component_kind);
+CREATE UNIQUE INDEX ON lk_cxr_component(source_note_id);
+CREATE TABLE IF NOT EXISTS :"etl_schema".cxr_component (
+    subject_id integer NOT NULL, study_id integer NOT NULL, component_kind text NOT NULL,
+    source_note_id text NOT NULL UNIQUE, source_start integer NOT NULL, source_length integer NOT NULL,
+    decision text NOT NULL, radiology_note_id text, match_method text, candidate_count bigint NOT NULL,
+    PRIMARY KEY (study_id, component_kind)
+);
+-- Check the whole corpus. COUNT avoids an EXISTS plan optimized to find
+-- the first mismatch, which does not exist when the reconstruction passes.
+INSERT INTO modality_checks VALUES
+    ('component_source_reconstruction', (
+        SELECT count(*) = 0 FROM :"source_schema".cxr_reports raw
+        LEFT JOIN (
+            SELECT comp.study_id,
+                string_agg(substr(src.text, comp.source_start, comp.source_length), '' ORDER BY comp.source_start) AS text
+            FROM lk_cxr_component comp
+            INNER JOIN :"source_schema".cxr_reports src ON CAST(src.study_id AS integer) = comp.study_id
+            GROUP BY comp.study_id
+        ) parts ON parts.study_id = CAST(raw.study_id AS integer)
+        WHERE raw.text IS DISTINCT FROM parts.text
+    )),
+    ('stable_existing_components', NOT EXISTS (
+        SELECT 1 FROM :"etl_schema".cxr_component old LEFT JOIN lk_cxr_component new USING (study_id, component_kind)
+        WHERE old.decision IN ('MATCHED_RADIOLOGY','NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
+          AND (new.study_id IS NULL OR (old.source_note_id,old.source_start,old.source_length,old.decision,old.radiology_note_id)
+              IS DISTINCT FROM (new.source_note_id,new.source_start,new.source_length,new.decision,new.radiology_note_id))
+    ));
+DELETE FROM :"etl_schema".cxr_component;
+INSERT INTO :"etl_schema".cxr_component SELECT * FROM lk_cxr_component;
 
 -- -------------------------------------------------------------------
 -- Canonical source views for the existing NOTE mapping
@@ -218,20 +452,22 @@ INSERT INTO :"etl_schema".cxr_reconciliation SELECT * FROM lk_cxr_resolution;
 
 CREATE OR REPLACE VIEW :"source_schema".cxr AS
 SELECT
-    link.source_note_id                         AS note_id,
+    comp.source_note_id                         AS note_id,
     link.subject_id                             AS subject_id,
     CAST(NULL AS integer)                       AS hadm_id,
-    'CXR'::text                                 AS note_type,
+    CASE WHEN comp.component_kind = 'PREFIX' THEN 'CXR_SUPPLEMENT' ELSE 'CXR' END AS note_type,
     0                                           AS note_seq,
     link.study_datetime                         AS charttime,
     CAST(NULL AS timestamp)                     AS storetime,
-    raw.text                                    AS text
+    substr(raw.text, comp.source_start, comp.source_length) AS text
 FROM
     :"source_schema".cxr_reports raw
 INNER JOIN
     :"etl_schema".cxr_reconciliation link ON link.study_id = CAST(raw.study_id AS integer)
+INNER JOIN
+    :"etl_schema".cxr_component comp ON comp.study_id = link.study_id
 WHERE
-    link.decision = 'NEW_NO_PATIENT_RADIOLOGY'
+    comp.decision IN ('NEW_NO_PATIENT_RADIOLOGY','NEW_NO_NEARBY_RADIOLOGY','NEW_SUPPLEMENT')
 ;
 CREATE OR REPLACE VIEW :"source_schema".cxr_detail AS
 SELECT
@@ -241,8 +477,11 @@ SELECT
     raw.study_id                                AS field_value,
     1                                           AS field_ordinal
 FROM :"source_schema".cxr src
-INNER JOIN :"source_schema".cxr_reports raw
-    ON src.note_id = raw.subject_id || '-CXR-' || raw.study_id
+INNER JOIN :"etl_schema".cxr_component comp ON comp.source_note_id = src.note_id
+INNER JOIN :"source_schema".cxr_reports raw ON CAST(raw.study_id AS integer) = comp.study_id
+UNION ALL
+SELECT src.note_id, src.subject_id, 'timestamp_basis', 'STUDY_ACQUISITION_TIME_NOT_DOCUMENT_AVAILABILITY', 1
+FROM :"source_schema".cxr src
 ;
 
 CREATE OR REPLACE VIEW :"source_schema".ecg_machine AS

@@ -66,6 +66,7 @@ INSERT INTO lk_note_type VALUES
     ('radiology', 'RR', '68604-8', 'Radiology report'),
     ('radiology', 'AR', '68604-8', 'Radiology report addendum'),
     ('cxr', 'CXR', '68604-8', 'Chest radiograph report'),
+    ('cxr', 'CXR_SUPPLEMENT', '68604-8', 'Chest radiograph supplementary report (preliminary/addendum)'),
     ('ecg_machine', 'ECG_MACHINE', '75425-9', 'ECG machine interpretation');
 
 -- -------------------------------------------------------------------
